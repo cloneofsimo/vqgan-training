@@ -1,0 +1,4 @@
+wandb
+*.torrent
+celebvq
+__pycache__
