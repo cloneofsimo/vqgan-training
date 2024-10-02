@@ -2,3 +2,5 @@ wandb
 *.torrent
 celebvq
 __pycache__
+vgg.pth
+*_tester.ipynb
