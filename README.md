@@ -1,6 +1,7 @@
 # VAE Trainer
 
-The famous VAE of latent diffusion models, such as stable diffusion, FLUX, SORA, etc. How are they trained? This is my attempt to write distributed VAE trainer.
+The famous VAE of latent diffusion models, such as stable diffusion, FLUX, SORA, etc. How are they trained? This is my attempt to write distributed VAE trainer. It is largely based on [LDM's VAE](https://arxiv.org/abs/2112.10752)
+
 
 ## Details
 
@@ -11,14 +12,18 @@ This project implements a distributed VAE trainer using PyTorch's DistributedDat
 1. **Distributed Training**: Utilizes PyTorch's DDP for efficient multi-GPU training.
 2. **GAN Loss**: Optional GAN loss for improved image quality.
 3. **Perceptual Loss**: Uses LPIPS for perceptual similarity.
-4. **Gradient Normalization**: Custom gradient normalization for stable training.
-5. **WebDataset Support**: Efficient data loading using WebDataset.
+4. **Gradient Normalization**: This wasn't on the LDM's paper, but gradient normalization for stable training was simpler than rebalancing by hacking autograd mechanism.
+5. **Log-variance clipping**: This is a modification of KL divergence loss, by clipping the log-variance to not make it too small.
 
 - `ae.py`: Contains the VAE architecture implementation.
 
 - `vae_trainer.py`: Main training script with DDP setup.
 
 - `utils.py`: Utility functions and classes, including LPIPS and PatchDiscriminator.
+
+For more details, please refer to the appendix in the LDM paper.
+
+![appendix](contents/appg.png)
 
 ## Usage
 
