@@ -9,25 +9,33 @@ import torchvision.transforms as transforms
 import torchvision.models as models
 import wandb
 
-from utils import LPIPS
 import torch
 import torch.nn as nn
-import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
+import numpy as np
+import random
+
+import click
 import os
 import logging
+
+from utils import LPIPS, PatchDiscriminator
+
+from ae import VAE
 
 
 class GradNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
+
         return x.clone()
 
     @staticmethod
     def backward(ctx, grad_output):
 
-        grad_output_norm = torch.norm(grad_output)
+        grad_output_norm = torch.linalg.norm(grad_output, dim=0, keepdim=True)
+        # print(grad_output_norm.shape)
 
         grad_output_normalized = grad_output / (grad_output_norm + 1e-8)
 
@@ -38,147 +46,6 @@ def gradnorm(x):
     return GradNormFunction.apply(x)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, groups=8):
-        super(ResBlock, self).__init__()
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
-        )
-        self.norm1 = nn.GroupNorm(groups, out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
-        )
-        self.norm2 = nn.GroupNorm(groups, out_channels)
-
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(
-                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
-                ),
-                nn.GroupNorm(groups, out_channels),
-            )
-        else:
-            self.shortcut = nn.Identity()
-
-    def forward(self, x):
-        identity = self.shortcut(x)
-        out = self.relu(self.norm1(self.conv1(x)))
-        out = self.norm2(self.conv2(out))
-        out += identity
-        return self.relu(out)
-
-
-class ResNetEncoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256, width_mult=1.0, groups=8):
-        super(ResNetEncoder, self).__init__()
-        base_channels = int(64 * width_mult)
-
-        self.initial_conv = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                base_channels,
-                kernel_size=7,
-                stride=2,
-                padding=3,
-                bias=False,
-            ),
-            nn.GroupNorm(groups, base_channels),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-        )
-
-        self.layer1 = ResBlock(
-            base_channels, base_channels * 2, stride=2, groups=groups
-        )
-
-        self.final_conv = nn.Conv2d(
-            base_channels * 2, latent_dim, kernel_size=1, stride=1, bias=False
-        )
-
-    def forward(self, x):
-        x = self.initial_conv(x)
-        x = self.layer1(x)
-        x = self.final_conv(x)
-        return x
-
-
-class ResNetDecoder(nn.Module):
-    def __init__(self, latent_dim=256, out_channels=3, width_mult=1.0, groups=8):
-        super(ResNetDecoder, self).__init__()
-        base_channels = int(64 * width_mult)
-
-        self.initial_conv = nn.ConvTranspose2d(
-            latent_dim, base_channels * 2, kernel_size=1, stride=1, bias=False
-        )
-
-        self.layer1 = nn.Sequential(
-            ResBlock(base_channels * 2, base_channels * 2, stride=1, groups=groups),
-            nn.ConvTranspose2d(
-                base_channels * 2,
-                base_channels,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.GroupNorm(groups, base_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        self.layer2 = nn.Sequential(
-            ResBlock(base_channels, base_channels, stride=1, groups=groups),
-            nn.ConvTranspose2d(
-                base_channels,
-                out_channels,
-                kernel_size=4,
-                stride=4,
-                padding=0,
-            ),
-        )
-
-    def forward(self, x):
-        x = self.initial_conv(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        return torch.tanh(x)
-
-
-class VAE(nn.Module):
-    def __init__(self, width_mult=1.0, latent_dim=256):
-        super(VAE, self).__init__()
-        self.encoder = ResNetEncoder(width_mult=width_mult, latent_dim=latent_dim)
-        self.decoder = ResNetDecoder(width_mult=width_mult, latent_dim=latent_dim)
-
-    def forward(self, x):
-        latent = self.encoder(x)
-        reconstruction = self.decoder(latent)
-        return reconstruction, latent
-
-
-class PatchDiscriminator(nn.Module):
-    def __init__(self, in_channels=3):
-        super(PatchDiscriminator, self).__init__()
-        self.discriminator = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 1, kernel_size=4, stride=2, padding=1),
-        )
-
-    def forward(self, x):
-        return self.discriminator(x)
-
-
 def gan_disc_loss(real_preds, fake_preds):
     real_loss = nn.functional.binary_cross_entropy_with_logits(
         real_preds, torch.ones_like(real_preds)
@@ -186,21 +53,17 @@ def gan_disc_loss(real_preds, fake_preds):
     fake_loss = nn.functional.binary_cross_entropy_with_logits(
         fake_preds, torch.zeros_like(fake_preds)
     )
-    return real_loss + fake_loss
-
-
-def perceptual_loss(reconstructed, real, vgg_model):
-    real_features = vgg_model(real)
-    reconstructed_features = vgg_model(reconstructed)
-    loss = nn.functional.mse_loss(reconstructed_features, real_features)
-    return loss
+    # eval its online performance
+    got_real_right = real_preds.mean()
+    got_fake_right = fake_preds.mean()
+    return real_loss + fake_loss, got_real_right, got_fake_right
 
 
 this_transform = transforms.Compose(
     [
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        transforms.CenterCrop(512),
+        transforms.CenterCrop(256),
     ]
 )
 
@@ -223,13 +86,133 @@ def create_dataloader(url, batch_size, num_workers, do_shuffle=True):
     return loader
 
 
+class SoftLargePenalty(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold):
+        ctx.save_for_backward(x, threshold)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, threshold = ctx.saved_tensors
+        x_where_large = (x.abs() > threshold).float()
+        return grad_output * x_where_large, None
+
+
+def soft_large_penalty(x, threshold=1.0):
+    # return SoftLargePenalty.apply(x, torch.tensor(threshold, dtype=x.dtype, device=x.device))
+    return x
+
+
+def vae_loss_function(x, x_reconstructed, z):
+    # downsample images by factor of 8
+    x_reconstructed_down = F.interpolate(
+        x_reconstructed, scale_factor=1 / 8, mode="bilinear", align_corners=False
+    )
+    x_down = F.interpolate(x, scale_factor=1 / 8, mode="bilinear", align_corners=False)
+
+    recon_loss = (x_reconstructed_down - x_down).abs().mean()
+
+    # KL loss
+    mean, logvar = torch.chunk(z, 2, dim=1)
+    elewise_kl_loss = -1 - logvar + logvar.exp()
+    modified_kl_loss = soft_large_penalty(elewise_kl_loss, threshold=0.4).pow(2)
+
+    elewise_mean_loss = mean.pow(2)
+    modified_mean_loss = soft_large_penalty(elewise_mean_loss, threshold=0.4)
+
+    total_loss = (modified_kl_loss + modified_mean_loss).mean()
+
+    with torch.no_grad():
+        actual_kl_loss = elewise_kl_loss.mean()
+        actual_mean_loss = elewise_mean_loss.mean()
+        actual_ks_loss = (actual_kl_loss + actual_mean_loss).mean()
+
+    vae_loss = recon_loss + total_loss * 4.0
+    return vae_loss, {
+        "recon_loss": recon_loss.item(),
+        "kl_loss": actual_ks_loss.item(),
+        "average_of_abs_z": z.abs().mean().item(),
+        "std_of_abs_z": z.abs().std().item(),
+        "average_of_logvar": logvar.mean().item(),
+        "std_of_logvar": logvar.std().item(),
+    }
+
+
 def cleanup():
     dist.destroy_process_group()
 
 
+@click.command()
+@click.option(
+    "--dataset_url", type=str, default="", help="URL for the training dataset"
+)
+@click.option(
+    "--test_dataset_url", type=str, default="", help="URL for the test dataset"
+)
+@click.option("--num_epochs", type=int, default=2, help="Number of training epochs")
+@click.option("--batch_size", type=int, default=16, help="Batch size for training")
+@click.option("--do_ganloss", is_flag=True, help="Whether to use GAN loss")
+@click.option(
+    "--learning_rate_vae", type=float, default=1e-5, help="Learning rate for VAE"
+)
+@click.option(
+    "--learning_rate_disc",
+    type=float,
+    default=2e-4,
+    help="Learning rate for discriminator",
+)
+@click.option("--vae_resolution", type=int, default=256, help="Resolution for VAE")
+@click.option("--vae_in_channels", type=int, default=3, help="Input channels for VAE")
+@click.option("--vae_ch", type=int, default=256, help="Base channel size for VAE")
+@click.option(
+    "--vae_ch_mult", type=str, default="1,2,4,4", help="Channel multipliers for VAE"
+)
+@click.option(
+    "--vae_num_res_blocks",
+    type=int,
+    default=2,
+    help="Number of residual blocks for VAE",
+)
+@click.option(
+    "--vae_z_channels", type=int, default=16, help="Number of latent channels for VAE"
+)
+@click.option(
+    '--run_name', type=str, default='run', help='Name of the run for wandb'
+)
 def train_ddp(
-    dataset_url, test_dataset_url, num_epochs=50, batch_size=16, do_ganloss=True
+    dataset_url,
+    test_dataset_url,
+    num_epochs,
+    batch_size,
+    do_ganloss,
+    learning_rate_vae,
+    learning_rate_disc,
+    vae_resolution,
+    vae_in_channels,
+    vae_ch,
+    vae_ch_mult,
+    vae_num_res_blocks,
+    vae_z_channels,
+    run_name,
 ):
+    
+    # fix random seed
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
+    random.seed(42)
+
+    start_train = 0
+    end_train = 128 * 3
+
+    start_test = end_train + 1
+    end_test = start_test + 8
+
+    dataset_url = f"/home/ubuntu/ultimate_pipe/flux_ipadapter_trainer/dataset/art_webdataset/{{{start_train:05d}..{end_train:05d}}}.tar"
+    test_dataset_url = f"/home/ubuntu/ultimate_pipe/flux_ipadapter_trainer/dataset/art_webdataset/{{{start_test:05d}..{end_test:05d}}}.tar"
+
 
     assert torch.cuda.is_available(), "CUDA is required for DDP"
 
@@ -243,16 +226,38 @@ def train_ddp(
     print(f"using device: {device}")
 
     if master_process:
-        wandb.init(project="vae-gan-ddp", entity="simo", name=f"run")
+        wandb.init(project="vae-gan-ddp-sweep", entity="simo", name=run_name,
+                   config={
+                       "learning_rate_vae": learning_rate_vae,
+                       "learning_rate_disc": learning_rate_disc,
+                       "vae_ch": vae_ch,
+                       "vae_resolution": vae_resolution,
+                       "vae_in_channels": vae_in_channels,
+                       "vae_ch_mult": vae_ch_mult,
+                       "vae_num_res_blocks": vae_num_res_blocks,
+                       "vae_z_channels": vae_z_channels,
+                       "batch_size": batch_size,
+                       "num_epochs": num_epochs,
+                       "do_ganloss": do_ganloss,
+                   })
 
-    vae = VAE(width_mult=1.0).cuda()
+    vae = VAE(
+        resolution=vae_resolution,
+        in_channels=vae_in_channels,
+        ch=vae_ch,
+        out_ch=vae_in_channels,
+        ch_mult=[int(x) for x in vae_ch_mult.split(",")],
+        num_res_blocks=vae_num_res_blocks,
+        z_channels=vae_z_channels,
+    ).cuda()
+
     discriminator = PatchDiscriminator().cuda()
 
     vae = DDP(vae, device_ids=[ddp_rank])
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
 
-    optimizer_G = optim.Adam(vae.parameters(), lr=2e-5)
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=2e-5)
+    optimizer_G = optim.AdamW(vae.parameters(), lr=learning_rate_vae / vae_ch, weight_decay=1e-3, betas=(0.9, 0.95))
+    optimizer_D = optim.AdamW(discriminator.parameters(), lr=learning_rate_disc / vae_ch, weight_decay=1e-3, betas=(0.9, 0.95))
 
     lpips = LPIPS().cuda()
 
@@ -273,11 +278,12 @@ def train_ddp(
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-
+    global_step = 0
     for epoch in range(num_epochs):
         for i, real_images in enumerate(dataloader):
+            
             real_images = real_images[0].to(device)
-            reconstructed, _ = vae(real_images)
+            reconstructed, z = vae(real_images)
 
             if do_ganloss:
                 real_preds = discriminator(real_images)
@@ -285,11 +291,15 @@ def train_ddp(
                 d_loss = gan_disc_loss(real_preds, fake_preds).mean()
                 d_loss.backward(retain_graph=True)
 
-            recon_for_perceptual = gradnorm(reconstructed)
-            percep_rec_loss = lpips(recon_for_perceptual, real_images).mean()
+            # unnormalize the images, and perceptual loss
+            _recon_for_perceptual = gradnorm(reconstructed)
+            _real_images = real_images * 0.5 + 0.5
+            _recon_for_perceptual = _recon_for_perceptual * 0.5 + 0.5
+            percep_rec_loss = lpips(_recon_for_perceptual, _real_images).mean()
 
+            # mse, vae loss.
             recon_for_mse = gradnorm(reconstructed)
-            mse_recon_loss = nn.functional.mse_loss(recon_for_mse, real_images)
+            vae_loss, loss_data = vae_loss_function(real_images, recon_for_mse, z)
             # gan loss
             if do_ganloss:
                 recon_for_gan = gradnorm(reconstructed)
@@ -299,9 +309,9 @@ def train_ddp(
                 )
                 gan_loss_value = fake_criterion.mean()
 
-                overall_vae_loss = percep_rec_loss + gan_loss_value + mse_recon_loss
+                overall_vae_loss = percep_rec_loss + gan_loss_value + vae_loss
             else:
-                overall_vae_loss = percep_rec_loss + mse_recon_loss
+                overall_vae_loss = percep_rec_loss + vae_loss
 
             overall_vae_loss.backward()
             optimizer_G.step()
@@ -316,17 +326,53 @@ def train_ddp(
                     {
                         "epoch": epoch,
                         "batch": i,
-                        "d_loss": d_loss.item(),
+                        "d_loss": d_loss.item() if do_ganloss else None,
                         "overall_vae_loss": overall_vae_loss.item(),
-                        "mse_loss": mse_recon_loss.item(),
+                        "mse_loss": loss_data["recon_loss"],
+                        "kl_loss": loss_data["kl_loss"],
                         "perceptual_loss": percep_rec_loss.item(),
-                        "gan_loss": gan_loss_value.item(),
+                        "gan_loss": gan_loss_value.item() if do_ganloss else None,
+                        "abs_mu": loss_data["average_of_abs_z"],
+                        "abs_logvar": loss_data["average_of_logvar"]
                     }
                 )
+                
+                if global_step % 200 == 0:
+         
+                    wandb.log({
+                        f"loss_stepwise/mse_loss_{global_step}": loss_data["recon_loss"],
+                        f"loss_stepwise/kl_loss_{global_step}": loss_data["kl_loss"],
+                        f"loss_stepwise/overall_vae_loss_{global_step}": overall_vae_loss.item(),
+                    })
+                        
 
-                logger.info(
-                    f"Epoch [{epoch}/{num_epochs}] - d_loss: {d_loss.item():.4f}, gan_loss: {gan_loss_value.item():.4f}, perceptual_loss: {percep_rec_loss.item():.4f}, mse_loss: {mse_recon_loss.item():.4f}, overall_vae_loss: {overall_vae_loss.item():.4f}"
+                log_message = f"Epoch [{epoch}/{num_epochs}] - "
+                log_items = [
+                    ("perceptual_loss", percep_rec_loss.item()),
+                    ("mse_loss", loss_data["recon_loss"]),
+                    ("kl_loss", loss_data["kl_loss"]),
+                    ("overall_vae_loss", overall_vae_loss.item()),
+                    ("ABS mu (0.0): average_of_abs_z", loss_data["average_of_abs_z"]),
+                    ("STD mu : std_of_abs_z", loss_data["std_of_abs_z"]),
+                    (
+                        "ABS logvar (0.0) : average_of_logvar",
+                        loss_data["average_of_logvar"],
+                    ),
+                    ("STD logvar : std_of_logvar", loss_data["std_of_logvar"]),
+                ]
+
+                if do_ganloss:
+                    log_items = [
+                        ("d_loss", d_loss.item()),
+                        ("gan_loss", gan_loss_value.item()),
+                    ] + log_items
+
+                log_message += "\n\t".join(
+                    [f"{key}: {value:.4f}" for key, value in log_items]
                 )
+                logger.info(log_message)
+                
+                global_step += 1
 
         with torch.no_grad():
             if master_process:
@@ -356,13 +402,16 @@ def train_ddp(
                     )
 
                     break
-
+                
+            os.makedirs(f"./ckpt/{run_name}", exist_ok=True)
+            torch.save(vae.state_dict(), f"./ckpt/{run_name}/vae_epoch_{epoch}.pt")
     cleanup()
 
 
 if __name__ == "__main__":
 
-    dataset_url = "/home/ubuntu/ultimate_pipe/flux_ipadapter_trainer/dataset/art_webdataset/{00000..00127}.tar"
-    test_dataset_url = "/home/ubuntu/ultimate_pipe/flux_ipadapter_trainer/dataset/art_webdataset/{00128..00255}.tar"
+    #  torchrun --nproc_per_node=8 vae_trainer.py
+    train_ddp()
 
-    train_ddp(dataset_url, test_dataset_url)
+    
+    # train_ddp(dataset_url, test_dataset_url)

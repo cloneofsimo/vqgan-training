@@ -139,6 +139,147 @@ def spatial_average(x, keepdim=True):
     return x.mean([2, 3], keepdim=keepdim)
 
 
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, groups=8):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.norm1 = nn.GroupNorm(groups, out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.norm2 = nn.GroupNorm(groups, out_channels)
+
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.GroupNorm(groups, out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        out += identity
+        return self.relu(out)
+
+
+class ResNetEncoder(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256, width_mult=1.0, groups=8):
+        super(ResNetEncoder, self).__init__()
+        base_channels = int(64 * width_mult)
+
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                base_channels,
+                kernel_size=7,
+                stride=2,
+                padding=3,
+                bias=False,
+            ),
+            nn.GroupNorm(groups, base_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        )
+
+        self.layer1 = ResBlock(
+            base_channels, base_channels * 2, stride=2, groups=groups
+        )
+
+        self.final_conv = nn.Conv2d(
+            base_channels * 2, latent_dim, kernel_size=1, stride=1, bias=False
+        )
+
+    def forward(self, x):
+        x = self.initial_conv(x)
+        x = self.layer1(x)
+        x = self.final_conv(x)
+        return x
+
+
+class ResNetDecoder(nn.Module):
+    def __init__(self, latent_dim=256, out_channels=3, width_mult=1.0, groups=8):
+        super(ResNetDecoder, self).__init__()
+        base_channels = int(64 * width_mult)
+
+        self.initial_conv = nn.ConvTranspose2d(
+            latent_dim, base_channels * 2, kernel_size=1, stride=1, bias=False
+        )
+
+        self.layer1 = nn.Sequential(
+            ResBlock(base_channels * 2, base_channels * 2, stride=1, groups=groups),
+            nn.ConvTranspose2d(
+                base_channels * 2,
+                base_channels,
+                kernel_size=4,
+                stride=2,
+                padding=1,
+            ),
+            nn.GroupNorm(groups, base_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.layer2 = nn.Sequential(
+            ResBlock(base_channels, base_channels, stride=1, groups=groups),
+            nn.ConvTranspose2d(
+                base_channels,
+                out_channels,
+                kernel_size=4,
+                stride=4,
+                padding=0,
+            ),
+        )
+
+    def forward(self, x):
+        x = self.initial_conv(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        return torch.tanh(x)
+
+
+class VAE(nn.Module):
+    def __init__(self, width_mult=1.0, latent_dim=256):
+        super(VAE, self).__init__()
+        self.encoder = ResNetEncoder(width_mult=width_mult, latent_dim=latent_dim)
+        self.decoder = ResNetDecoder(width_mult=width_mult, latent_dim=latent_dim)
+
+    def forward(self, x):
+        latent = self.encoder(x)
+        reconstruction = self.decoder(latent)
+        return reconstruction, latent
+
+
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_channels=3):
+        super(PatchDiscriminator, self).__init__()
+        self.discriminator = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 1, kernel_size=4, stride=2, padding=1),
+        )
+
+    def forward(self, x):
+        return self.discriminator(x)
+
+
 if __name__ == "__main__":
     lpips = LPIPS()
     print(lpips(torch.randn(1, 3, 256, 256), torch.randn(1, 3, 256, 256)))
