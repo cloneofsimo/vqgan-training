@@ -1,22 +1,11 @@
-from dataclasses import dataclass
+# Take from FLUX
 
-import torch
-from einops import rearrange
-import torch.nn.functional as F
-from torch import Tensor, nn
+
 import math
-
-@dataclass
-class AutoEncoderParams:
-    resolution: int
-    in_channels: int
-    ch: int
-    out_ch: int
-    ch_mult: list[int]
-    num_res_blocks: int
-    z_channels: int
-    scale_factor: float
-    shift_factor: float
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import Tensor, nn
 
 
 def swish(x: Tensor) -> Tensor:
@@ -29,30 +18,29 @@ class AttnBlock(nn.Module):
         self.in_channels = in_channels
         self.num_heads = 8
         self.head_dim = in_channels // self.num_heads
-
         self.norm = nn.GroupNorm(
             num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
         )
+        self.qkv = nn.Conv2d(in_channels, in_channels * 3, kernel_size=1, bias=False)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        nn.init.normal_(self.proj_out.weight, std=0.2 / math.sqrt(in_channels))
 
-        self.qkv = nn.Conv2d(in_channels, in_channels * 3, kernel_size=1, bias = False)
-        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias = False)
-        # initialize with near zero for conv2d
-        
-        nn.init.normal_(self.proj_out.weight, std=0.2/math.sqrt(in_channels))
-        
     def attention(self, h_: Tensor) -> Tensor:
         h_ = self.norm(h_)
         qkv = self.qkv(h_)
         q, k, v = qkv.chunk(3, dim=1)
-
         b, c, h, w = q.shape
-        q = rearrange(q, "b (h d) x y -> b h (x y) d", h=self.num_heads, d=self.head_dim)
-        k = rearrange(k, "b (h d) x y -> b h (x y) d", h=self.num_heads, d=self.head_dim)
-        v = rearrange(v, "b (h d) x y -> b h (x y) d", h=self.num_heads, d=self.head_dim)
-
+        q = rearrange(
+            q, "b (h d) x y -> b h (x y) d", h=self.num_heads, d=self.head_dim
+        )
+        k = rearrange(
+            k, "b (h d) x y -> b h (x y) d", h=self.num_heads, d=self.head_dim
+        )
+        v = rearrange(
+            v, "b (h d) x y -> b h (x y) d", h=self.num_heads, d=self.head_dim
+        )
         h_ = F.scaled_dot_product_attention(q, k, v)
         h_ = rearrange(h_, "b h (x y) d -> b (h d) x y", x=h, y=w)
-
         return h_
 
     def forward(self, x: Tensor) -> Tensor:
@@ -65,7 +53,6 @@ class ResnetBlock(nn.Module):
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
-
         self.norm1 = nn.GroupNorm(
             num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
         )
@@ -88,21 +75,17 @@ class ResnetBlock(nn.Module):
         h = self.norm1(h)
         h = swish(h)
         h = self.conv1(h)
-
         h = self.norm2(h)
         h = swish(h)
         h = self.conv2(h)
-
         if self.in_channels != self.out_channels:
             x = self.nin_shortcut(x)
-
         return x + h
 
 
 class Downsample(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
-        # no asymmetric padding in torch conv, must do it ourselves
         self.conv = nn.Conv2d(
             in_channels, in_channels, kernel_size=3, stride=2, padding=0
         )
@@ -143,11 +126,9 @@ class Encoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
-        # downsampling
         self.conv_in = nn.Conv2d(
             in_channels, self.ch, kernel_size=3, stride=1, padding=1
         )
-
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
         self.in_ch_mult = in_ch_mult
@@ -168,14 +149,10 @@ class Encoder(nn.Module):
                 down.downsample = Downsample(block_in)
                 curr_res = curr_res // 2
             self.down.append(down)
-
-        # middle
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
         self.mid.attn_1 = AttnBlock(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-
-        # end
         self.norm_out = nn.GroupNorm(
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
         )
@@ -184,7 +161,6 @@ class Encoder(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        # downsampling
         h = self.conv_in(x)
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -193,12 +169,9 @@ class Encoder(nn.Module):
                     h = self.down[i_level].attn[i_block](h)
             if i_level != self.num_resolutions - 1:
                 h = self.down[i_level].downsample(h)
-
-        # middle
         h = self.mid.block_1(h)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h)
-        # end
         h = self.norm_out(h)
         h = swish(h)
         h = self.conv_out(h)
@@ -223,24 +196,16 @@ class Decoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
         self.ffactor = 2 ** (self.num_resolutions - 1)
-
-        # compute in_ch_mult, block_in and curr_res at lowest res
         block_in = ch * ch_mult[self.num_resolutions - 1]
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)
-
-        # z to block_in
         self.conv_in = nn.Conv2d(
             z_channels, block_in, kernel_size=3, stride=1, padding=1
         )
-
-        # middle
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
         self.mid.attn_1 = AttnBlock(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-
-        # upsampling
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
@@ -255,24 +220,17 @@ class Decoder(nn.Module):
             if i_level != 0:
                 up.upsample = Upsample(block_in)
                 curr_res = curr_res * 2
-            self.up.insert(0, up)  # prepend to get consistent order
-
-        # end
+            self.up.insert(0, up)
         self.norm_out = nn.GroupNorm(
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
         )
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z: Tensor) -> Tensor:
-        # z to block_in
         h = self.conv_in(z)
-
-        # middle
         h = self.mid.block_1(h)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h)
-
-        # upsampling
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 h = self.up[i_level].block[i_block](h)
@@ -280,8 +238,6 @@ class Decoder(nn.Module):
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
-
-        # end
         h = self.norm_out(h)
         h = swish(h)
         h = self.conv_out(h)
@@ -297,7 +253,6 @@ class DiagonalGaussian(nn.Module):
     def forward(self, z: Tensor) -> Tensor:
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
         if self.sample:
-            # logvar should be at least -4
             logvar = logvar.clamp(min=-3)
             std = torch.exp(0.5 * logvar)
             return mean + std * torch.randn_like(mean)
@@ -327,11 +282,9 @@ class VAE(nn.Module):
             num_res_blocks=num_res_blocks,
             z_channels=z_channels,
         )
-
         self.reg = DiagonalGaussian()
 
     def forward(self, x: Tensor) -> Tensor:
-        # make z and decz
         z = self.encoder(x)
         z_s = self.reg(z)
         decz = self.decoder(z_s)
@@ -339,7 +292,6 @@ class VAE(nn.Module):
 
 
 if __name__ == "__main__":
-
     vae = VAE(
         resolution=256,
         in_channels=3,
@@ -349,24 +301,7 @@ if __name__ == "__main__":
         num_res_blocks=2,
         z_channels=16,
     )
-
     vae.eval().to("cuda")
-
     x = torch.randn(1, 3, 256, 256).to("cuda")
     decz, z = vae(x)
     print(decz.shape, z.shape)
-
-    # ae_params = AutoEncoderParams(
-    #     resolution=256,
-    #     in_channels=3,
-    #     ch=128,
-    #     out_ch=3,
-    #     ch_mult=[1, 2, 4, 4],
-    #     num_res_blocks=2,
-    #     z_channels=16,
-    #     scale_factor=0.3611,
-    #     shift_factor=0.1159,
-    # )
-
-    # ae = AutoEncoder(ae_params)
-    # print(ae)

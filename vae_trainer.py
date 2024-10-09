@@ -1,28 +1,21 @@
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-import torch.multiprocessing as mp
-import torch.optim as optim
-from torch.nn.parallel import DistributedDataParallel as DDP
-import webdataset as wds
-import torchvision.transforms as transforms
-import torchvision.models as models
-import wandb
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-import numpy as np
+import logging
+import os
 import random
 
 import click
-import os
-import logging
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchvision.transforms as transforms
+import webdataset as wds
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from utils import LPIPS, PatchDiscriminator
-
+import wandb
 from ae import VAE
+from utils import LPIPS, PatchDiscriminator
 
 
 class GradNormFunction(torch.autograd.Function):
@@ -177,8 +170,12 @@ def cleanup():
 @click.option(
     "--vae_z_channels", type=int, default=16, help="Number of latent channels for VAE"
 )
+@click.option("--run_name", type=str, default="run", help="Name of the run for wandb")
 @click.option(
-    '--run_name', type=str, default='run', help='Name of the run for wandb'
+    "--max_steps", type=int, default=1000, help="Maximum number of steps to train for"
+)
+@click.option(
+    "--evaluate_every_n_steps", type=int, default=250, help="Evaluate every n steps"
 )
 def train_ddp(
     dataset_url,
@@ -195,8 +192,10 @@ def train_ddp(
     vae_num_res_blocks,
     vae_z_channels,
     run_name,
+    max_steps,
+    evaluate_every_n_steps,
 ):
-    
+
     # fix random seed
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -213,7 +212,6 @@ def train_ddp(
     dataset_url = f"/home/ubuntu/ultimate_pipe/flux_ipadapter_trainer/dataset/art_webdataset/{{{start_train:05d}..{end_train:05d}}}.tar"
     test_dataset_url = f"/home/ubuntu/ultimate_pipe/flux_ipadapter_trainer/dataset/art_webdataset/{{{start_test:05d}..{end_test:05d}}}.tar"
 
-
     assert torch.cuda.is_available(), "CUDA is required for DDP"
 
     dist.init_process_group(backend="nccl")
@@ -226,20 +224,24 @@ def train_ddp(
     print(f"using device: {device}")
 
     if master_process:
-        wandb.init(project="vae-gan-ddp-sweep", entity="simo", name=run_name,
-                   config={
-                       "learning_rate_vae": learning_rate_vae,
-                       "learning_rate_disc": learning_rate_disc,
-                       "vae_ch": vae_ch,
-                       "vae_resolution": vae_resolution,
-                       "vae_in_channels": vae_in_channels,
-                       "vae_ch_mult": vae_ch_mult,
-                       "vae_num_res_blocks": vae_num_res_blocks,
-                       "vae_z_channels": vae_z_channels,
-                       "batch_size": batch_size,
-                       "num_epochs": num_epochs,
-                       "do_ganloss": do_ganloss,
-                   })
+        wandb.init(
+            project="vae-gan-ddp-sweep",
+            entity="simo",
+            name=run_name,
+            config={
+                "learning_rate_vae": learning_rate_vae,
+                "learning_rate_disc": learning_rate_disc,
+                "vae_ch": vae_ch,
+                "vae_resolution": vae_resolution,
+                "vae_in_channels": vae_in_channels,
+                "vae_ch_mult": vae_ch_mult,
+                "vae_num_res_blocks": vae_num_res_blocks,
+                "vae_z_channels": vae_z_channels,
+                "batch_size": batch_size,
+                "num_epochs": num_epochs,
+                "do_ganloss": do_ganloss,
+            },
+        )
 
     vae = VAE(
         resolution=vae_resolution,
@@ -256,8 +258,26 @@ def train_ddp(
     vae = DDP(vae, device_ids=[ddp_rank])
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
 
-    optimizer_G = optim.AdamW(vae.parameters(), lr=learning_rate_vae / vae_ch, weight_decay=1e-3, betas=(0.9, 0.95))
-    optimizer_D = optim.AdamW(discriminator.parameters(), lr=learning_rate_disc / vae_ch, weight_decay=1e-3, betas=(0.9, 0.95))
+    optimizer_G = optim.AdamW(
+        [
+            {
+                "params": [p for n, p in vae.named_parameters() if "conv_in" not in n],
+                "lr": learning_rate_vae / vae_ch,
+            },
+            {
+                "params": [p for n, p in vae.named_parameters() if "conv_in" in n],
+                "lr": 1e-4,
+            },
+        ],
+        weight_decay=1e-3,
+        betas=(0.9, 0.95),
+    )
+    optimizer_D = optim.AdamW(
+        discriminator.parameters(),
+        lr=learning_rate_disc / vae_ch,
+        weight_decay=1e-3,
+        betas=(0.9, 0.95),
+    )
 
     lpips = LPIPS().cuda()
 
@@ -278,12 +298,16 @@ def train_ddp(
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+
     global_step = 0
     for epoch in range(num_epochs):
         for i, real_images in enumerate(dataloader):
-            
+
             real_images = real_images[0].to(device)
             reconstructed, z = vae(real_images)
+
+            if global_step >= max_steps:
+                break
 
             if do_ganloss:
                 real_preds = discriminator(real_images)
@@ -333,18 +357,23 @@ def train_ddp(
                         "perceptual_loss": percep_rec_loss.item(),
                         "gan_loss": gan_loss_value.item() if do_ganloss else None,
                         "abs_mu": loss_data["average_of_abs_z"],
-                        "abs_logvar": loss_data["average_of_logvar"]
+                        "abs_logvar": loss_data["average_of_logvar"],
                     }
                 )
-                
+
                 if global_step % 200 == 0:
-         
-                    wandb.log({
-                        f"loss_stepwise/mse_loss_{global_step}": loss_data["recon_loss"],
-                        f"loss_stepwise/kl_loss_{global_step}": loss_data["kl_loss"],
-                        f"loss_stepwise/overall_vae_loss_{global_step}": overall_vae_loss.item(),
-                    })
-                        
+
+                    wandb.log(
+                        {
+                            f"loss_stepwise/mse_loss_{global_step}": loss_data[
+                                "recon_loss"
+                            ],
+                            f"loss_stepwise/kl_loss_{global_step}": loss_data[
+                                "kl_loss"
+                            ],
+                            f"loss_stepwise/overall_vae_loss_{global_step}": overall_vae_loss.item(),
+                        }
+                    )
 
                 log_message = f"Epoch [{epoch}/{num_epochs}] - "
                 log_items = [
@@ -371,40 +400,52 @@ def train_ddp(
                     [f"{key}: {value:.4f}" for key, value in log_items]
                 )
                 logger.info(log_message)
-                
-                global_step += 1
 
-        with torch.no_grad():
-            if master_process:
-                for test_images in test_dataloader:
-                    test_images = test_images[0].to(device)
-                    reconstructed_test, _ = vae(test_images)
+            global_step += 1
 
-                    # unnormalize the images
-                    test_images = test_images * 0.5 + 0.5
-                    reconstructed_test = reconstructed_test * 0.5 + 0.5
+            if (
+                evaluate_every_n_steps > 0
+                and global_step % evaluate_every_n_steps == 0
+                and master_process
+            ):
 
-                    logger.info(f"Epoch [{epoch}/{num_epochs}] - Logging test images")
+                with torch.no_grad():
+                    for test_images in test_dataloader:
+                        test_images = test_images[0].to(device)
+                        reconstructed_test, _ = vae(test_images)
 
-                    wandb.log(
-                        {
-                            "reconstructed_test_images": [
-                                wandb.Image(test_images[0]),
-                                wandb.Image(reconstructed_test[0]),
-                                wandb.Image(test_images[1]),
-                                wandb.Image(reconstructed_test[1]),
-                                wandb.Image(test_images[2]),
-                                wandb.Image(reconstructed_test[2]),
-                                wandb.Image(test_images[3]),
-                                wandb.Image(reconstructed_test[3]),
-                            ]
-                        }
+                        # unnormalize the images
+                        test_images = test_images * 0.5 + 0.5
+                        reconstructed_test = reconstructed_test * 0.5 + 0.5
+
+                        logger.info(
+                            f"Epoch [{epoch}/{num_epochs}] - Logging test images"
+                        )
+
+                        wandb.log(
+                            {
+                                "reconstructed_test_images": [
+                                    wandb.Image(reconstructed_test[0]),
+                                    wandb.Image(reconstructed_test[1]),
+                                    wandb.Image(reconstructed_test[2]),
+                                    wandb.Image(reconstructed_test[3]),
+                                ],
+                                "test_images": [
+                                    wandb.Image(test_images[0]),
+                                    wandb.Image(test_images[1]),
+                                    wandb.Image(test_images[2]),
+                                    wandb.Image(test_images[3]),
+                                ],
+                            }
+                        )
+                        break
+
+                    os.makedirs(f"./ckpt/{run_name}", exist_ok=True)
+                    torch.save(
+                        vae.state_dict(), f"./ckpt/{run_name}/vae_epoch_{epoch}.pt"
                     )
+                    print(f"Saved checkpoint to ./ckpt/{run_name}/vae_epoch_{epoch}.pt")
 
-                    break
-                
-            os.makedirs(f"./ckpt/{run_name}", exist_ok=True)
-            torch.save(vae.state_dict(), f"./ckpt/{run_name}/vae_epoch_{epoch}.pt")
     cleanup()
 
 
@@ -413,5 +454,4 @@ if __name__ == "__main__":
     #  torchrun --nproc_per_node=8 vae_trainer.py
     train_ddp()
 
-    
     # train_ddp(dataset_url, test_dataset_url)

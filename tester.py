@@ -1,19 +1,18 @@
+import os
+
 import torch
-import torch.nn as nn
+import torch.optim as optim
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
+
 from vae_trainer import (
     VAE,
     PatchDiscriminator,
+    create_dataloader,
     gan_loss,
     perceptual_loss,
-    create_dataloader,
 )
-import torchvision.models as models
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from PIL import Image
-import numpy as np
-import os
-import torch.optim as optim
 
 
 # Sample Image for Testing
