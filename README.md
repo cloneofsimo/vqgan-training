@@ -14,6 +14,7 @@ This project implements a distributed VAE trainer using PyTorch's DistributedDat
 3. **Perceptual Loss**: Uses LPIPS for perceptual similarity.
 4. **Gradient Normalization**: This wasn't on the LDM's paper, but gradient normalization for stable training was simpler than rebalancing by hacking autograd mechanism.
 5. **Log-variance clipping**: This is a modification of KL divergence loss, by clipping the log-variance to not make it too small.
+6. **Pooled MSE**: This makes the mse not care about high frequency details, which is a modification of original VAE recon loss.
 
 - `ae.py`: Contains the VAE architecture implementation.
 
@@ -46,16 +47,5 @@ The trainer supports various configuration options through command-line argument
 
 For a full list of options, refer to the `train_ddp` function in `vae_trainer.py`.
 
-## Loss Functions
-
-The trainer uses a combination of losses for effective VAE training:
-
-1. Reconstruction Loss: L1 loss between downsampled original and reconstructed images.
-2. KL Divergence Loss: Modified KL loss with soft large penalty.
-3. Perceptual Loss: LPIPS-based perceptual similarity.
-4. GAN Loss (optional): Adversarial loss for improved image quality.
-
-
 ---
-
 Above readme was written by claude.
