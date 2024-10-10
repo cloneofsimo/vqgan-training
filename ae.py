@@ -16,8 +16,9 @@ class AttnBlock(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
         self.in_channels = in_channels
-        self.num_heads = 8
-        self.head_dim = in_channels // self.num_heads
+
+        self.head_dim = 64
+        self.num_heads = in_channels // self.head_dim
         self.norm = nn.GroupNorm(
             num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
         )

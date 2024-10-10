@@ -13,6 +13,11 @@ import torchvision.transforms as transforms
 import webdataset as wds
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from transformers import get_cosine_schedule_with_warmup
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 import wandb
 from ae import VAE
 from utils import LPIPS, PatchDiscriminator
@@ -100,9 +105,9 @@ def soft_large_penalty(x, threshold=1.0):
 def vae_loss_function(x, x_reconstructed, z):
     # downsample images by factor of 8
     x_reconstructed_down = F.interpolate(
-        x_reconstructed, scale_factor=1 / 8, mode="bilinear", align_corners=False
+        x_reconstructed, scale_factor=1 / 8, mode="area"
     )
-    x_down = F.interpolate(x, scale_factor=1 / 8, mode="bilinear", align_corners=False)
+    x_down = F.interpolate(x, scale_factor=1 / 8, mode="area")
 
     recon_loss = (x_reconstructed_down - x_down).abs().mean()
 
@@ -121,7 +126,7 @@ def vae_loss_function(x, x_reconstructed, z):
         actual_mean_loss = elewise_mean_loss.mean()
         actual_ks_loss = (actual_kl_loss + actual_mean_loss).mean()
 
-    vae_loss = recon_loss + total_loss * 4.0
+    vae_loss = recon_loss * 0.0 + total_loss * 1.0
     return vae_loss, {
         "recon_loss": recon_loss.item(),
         "kl_loss": actual_ks_loss.item(),
@@ -144,7 +149,7 @@ def cleanup():
     "--test_dataset_url", type=str, default="", help="URL for the test dataset"
 )
 @click.option("--num_epochs", type=int, default=2, help="Number of training epochs")
-@click.option("--batch_size", type=int, default=16, help="Batch size for training")
+@click.option("--batch_size", type=int, default=8, help="Batch size for training")
 @click.option("--do_ganloss", is_flag=True, help="Whether to use GAN loss")
 @click.option(
     "--learning_rate_vae", type=float, default=1e-5, help="Learning rate for VAE"
@@ -177,6 +182,9 @@ def cleanup():
 @click.option(
     "--evaluate_every_n_steps", type=int, default=250, help="Evaluate every n steps"
 )
+@click.option(
+    "--load_path", type=str, default=None, help="Path to load the model from"
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -194,6 +202,7 @@ def train_ddp(
     run_name,
     max_steps,
     evaluate_every_n_steps,
+    load_path,
 ):
 
     # fix random seed
@@ -204,7 +213,7 @@ def train_ddp(
     random.seed(42)
 
     start_train = 0
-    end_train = 128 * 3
+    end_train = 128 * 10
 
     start_test = end_train + 1
     end_test = start_test + 8
@@ -225,7 +234,7 @@ def train_ddp(
 
     if master_process:
         wandb.init(
-            project="vae-gan-ddp-sweep",
+            project="vae-gan-ddp-large",
             entity="simo",
             name=run_name,
             config={
@@ -256,6 +265,7 @@ def train_ddp(
     discriminator = PatchDiscriminator().cuda()
 
     vae = DDP(vae, device_ids=[ddp_rank])
+    # vae = torch.compile(vae, fullgraph=False, mode='reduce-overhead')
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
 
     optimizer_G = optim.AdamW(
@@ -288,6 +298,12 @@ def train_ddp(
         test_dataset_url, batch_size, num_workers=4, do_shuffle=False
     )
 
+    num_training_steps = max_steps
+    num_warmup_steps = 200
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer_G, num_warmup_steps, num_training_steps
+    )
+
     # Setup logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -300,6 +316,10 @@ def train_ddp(
         logger.addHandler(handler)
 
     global_step = 0
+    
+    if load_path is not None:
+        vae.load_state_dict(torch.load(load_path, map_location='cpu'))
+
     for epoch in range(num_epochs):
         for i, real_images in enumerate(dataloader):
 
@@ -317,9 +337,8 @@ def train_ddp(
 
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
-            _real_images = real_images * 0.5 + 0.5
-            _recon_for_perceptual = _recon_for_perceptual * 0.5 + 0.5
-            percep_rec_loss = lpips(_recon_for_perceptual, _real_images).mean()
+           
+            percep_rec_loss = lpips(_recon_for_perceptual, real_images).mean()
 
             # mse, vae loss.
             recon_for_mse = gradnorm(reconstructed)
@@ -340,6 +359,7 @@ def train_ddp(
             overall_vae_loss.backward()
             optimizer_G.step()
             optimizer_G.zero_grad()
+            lr_scheduler.step()
 
             if do_ganloss:
                 optimizer_D.step()
@@ -357,6 +377,7 @@ def train_ddp(
                         "perceptual_loss": percep_rec_loss.item(),
                         "gan_loss": gan_loss_value.item() if do_ganloss else None,
                         "abs_mu": loss_data["average_of_abs_z"],
+                        "std_mu": loss_data["std_of_abs_z"],
                         "abs_logvar": loss_data["average_of_logvar"],
                     }
                 )
@@ -405,11 +426,14 @@ def train_ddp(
 
             if (
                 evaluate_every_n_steps > 0
-                and global_step % evaluate_every_n_steps == 0
+                and global_step % evaluate_every_n_steps == 1
                 and master_process
             ):
 
                 with torch.no_grad():
+                    all_test_images = []
+                    all_reconstructed_test = []
+                    
                     for test_images in test_dataloader:
                         test_images = test_images[0].to(device)
                         reconstructed_test, _ = vae(test_images)
@@ -417,34 +441,52 @@ def train_ddp(
                         # unnormalize the images
                         test_images = test_images * 0.5 + 0.5
                         reconstructed_test = reconstructed_test * 0.5 + 0.5
+                        
+                        all_test_images.append(test_images)
+                        all_reconstructed_test.append(reconstructed_test)
+                        
+                        if len(all_test_images) >= 2:
+                            break
+                        
+                    test_images = torch.cat(all_test_images, dim=0)
+                    reconstructed_test = torch.cat(all_reconstructed_test, dim=0)
 
-                        logger.info(
-                            f"Epoch [{epoch}/{num_epochs}] - Logging test images"
-                        )
-
-                        wandb.log(
-                            {
-                                "reconstructed_test_images": [
-                                    wandb.Image(reconstructed_test[0]),
-                                    wandb.Image(reconstructed_test[1]),
-                                    wandb.Image(reconstructed_test[2]),
-                                    wandb.Image(reconstructed_test[3]),
-                                ],
-                                "test_images": [
-                                    wandb.Image(test_images[0]),
-                                    wandb.Image(test_images[1]),
-                                    wandb.Image(test_images[2]),
-                                    wandb.Image(test_images[3]),
-                                ],
-                            }
-                        )
-                        break
+                    logger.info(
+                        f"Epoch [{epoch}/{num_epochs}] - Logging test images"
+                    )
+                    
+                    # crop test and recon to 64 x 64
+                    D = 128
+                    offset = 0
+                    test_images = test_images[:, :, offset:offset+D, offset:offset+D].cpu()   
+                    reconstructed_test = reconstructed_test[:, :, offset:offset+D, offset:offset+D].cpu()
+                    
+                    # concat the images into one large image.
+                    # make size of (D * 4) x (D * 4)
+                    recon_all_image = torch.zeros((3, D * 4, D * 4))
+                    test_all_image = torch.zeros((3, D * 4, D * 4))
+                    
+                    for i in range(4):
+                        for j in range(4):
+                            recon_all_image[:, i * D:(i+1) * D, j * D:(j+1) * D] = reconstructed_test[i * 4 + j]
+                            test_all_image[:, i * D:(i+1) * D, j * D:(j+1) * D] = test_images[i * 4 + j]
+                            
+                    wandb.log(
+                        {
+                            "reconstructed_test_images": [
+                                wandb.Image(recon_all_image),
+                            ],
+                            "test_images": [
+                                wandb.Image(test_all_image),
+                            ],
+                        }
+                    )
 
                     os.makedirs(f"./ckpt/{run_name}", exist_ok=True)
                     torch.save(
-                        vae.state_dict(), f"./ckpt/{run_name}/vae_epoch_{epoch}.pt"
+                        vae.state_dict(), f"./ckpt/{run_name}/vae_epoch_{epoch}_step_{global_step}.pt"
                     )
-                    print(f"Saved checkpoint to ./ckpt/{run_name}/vae_epoch_{epoch}.pt")
+                    print(f"Saved checkpoint to ./ckpt/{run_name}/vae_epoch_{epoch}_step_{global_step}.pt")
 
     cleanup()
 
