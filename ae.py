@@ -2,6 +2,7 @@
 
 
 import math
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -158,7 +159,7 @@ class Encoder(nn.Module):
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
         )
         self.conv_out = nn.Conv2d(
-            block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1
+            block_in, z_channels, kernel_size=3, stride=1, padding=1
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -252,11 +253,10 @@ class DiagonalGaussian(nn.Module):
         self.chunk_dim = chunk_dim
 
     def forward(self, z: Tensor) -> Tensor:
-        mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
+        mean = z
         if self.sample:
-            logvar = logvar.clamp(min=-3)
-            std = torch.exp(0.5 * logvar)
-            return mean + std * torch.randn_like(mean)
+            std = 0.1
+            return mean * (1 + std * torch.randn_like(mean))
         else:
             return mean
 

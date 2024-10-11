@@ -12,7 +12,7 @@ import torch.optim as optim
 import torchvision.transforms as transforms
 import webdataset as wds
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from torchvision.transforms import GaussianBlur
 from transformers import get_cosine_schedule_with_warmup
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -44,6 +44,12 @@ def gradnorm(x):
     return GradNormFunction.apply(x)
 
 
+def avg_scalar_over_nodes(value: float, device):
+    value = torch.tensor(value, device=device)
+    dist.all_reduce(value, op=dist.ReduceOp.AVG)
+    return value.item()
+
+
 def gan_disc_loss(real_preds, fake_preds):
     real_loss = nn.functional.binary_cross_entropy_with_logits(
         real_preds, torch.ones_like(real_preds)
@@ -52,9 +58,10 @@ def gan_disc_loss(real_preds, fake_preds):
         fake_preds, torch.zeros_like(fake_preds)
     )
     # eval its online performance
-    got_real_right = real_preds.mean()
-    got_fake_right = fake_preds.mean()
-    return real_loss + fake_loss, got_real_right, got_fake_right
+    avg_real_preds = real_preds.mean().item()
+    avg_fake_preds = fake_preds.mean().item()
+
+    return real_loss + fake_loss, avg_real_preds, avg_fake_preds
 
 
 this_transform = transforms.Compose(
@@ -84,56 +91,74 @@ def create_dataloader(url, batch_size, num_workers, do_shuffle=True):
     return loader
 
 
-class SoftLargePenalty(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, threshold):
-        ctx.save_for_backward(x, threshold)
-        return x
+def blurriness_heatmap(input_image):
+    grayscale_image = input_image.mean(dim=1, keepdim=True)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, threshold = ctx.saved_tensors
-        x_where_large = (x.abs() > threshold).float()
-        return grad_output * x_where_large, None
-
-
-def soft_large_penalty(x, threshold=1.0):
-    # return SoftLargePenalty.apply(x, torch.tensor(threshold, dtype=x.dtype, device=x.device))
-    return x
-
-
-def vae_loss_function(x, x_reconstructed, z):
-    # downsample images by factor of 8
-    x_reconstructed_down = F.interpolate(
-        x_reconstructed, scale_factor=1 / 8, mode="area"
+    laplacian_kernel = torch.tensor(
+        [
+            [0, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1],
+            [1, 1, -20, 1, 1],
+            [1, 1, 1, 1, 1],
+            [0, 1, 1, 1, 0],
+        ],
+        dtype=torch.float32,
     )
-    x_down = F.interpolate(x, scale_factor=1 / 8, mode="area")
+    laplacian_kernel = laplacian_kernel.view(1, 1, 5, 5)
 
-    recon_loss = (x_reconstructed_down - x_down).abs().mean()
+    laplacian_kernel = laplacian_kernel.to(input_image.device)
 
-    # KL loss
-    mean, logvar = torch.chunk(z, 2, dim=1)
-    elewise_kl_loss = -1 - logvar + logvar.exp()
-    modified_kl_loss = soft_large_penalty(elewise_kl_loss, threshold=0.4).pow(2)
+    edge_response = F.conv2d(grayscale_image, laplacian_kernel, padding=2)
 
-    elewise_mean_loss = mean.pow(2)
+    edge_magnitude = GaussianBlur(kernel_size=(13, 13), sigma=(2.0, 2.0))(
+        edge_response.abs()
+    )
+
+    edge_magnitude = (edge_magnitude - edge_magnitude.min()) / (
+        edge_magnitude.max() - edge_magnitude.min() + 1e-8
+    )
+
+    blurriness_map = 1 - edge_magnitude
+
+    blurriness_map = torch.where(
+        blurriness_map < 0.8, torch.zeros_like(blurriness_map), blurriness_map
+    )
+
+    return blurriness_map.repeat(1, 3, 1, 1)
+
+
+def vae_loss_function(x, x_reconstructed, z, do_pool=True):
+    # downsample images by factor of 8
+    if do_pool:
+        x_reconstructed_down = F.interpolate(
+            x_reconstructed, scale_factor=1 / 4, mode="area"
+        )
+        x_down = F.interpolate(x, scale_factor=1 / 4, mode="area")
+    else:
+        x_reconstructed_down = x_reconstructed
+        x_down = x
+
+    recon_loss = (
+        ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down)).abs().mean()
+    )
+
+    elewise_mean_loss = z.pow(2)
     modified_mean_loss = soft_large_penalty(elewise_mean_loss, threshold=0.4)
 
-    total_loss = (modified_kl_loss + modified_mean_loss).mean()
+    total_loss = modified_mean_loss.mean()
 
     with torch.no_grad():
-        actual_kl_loss = elewise_kl_loss.mean()
         actual_mean_loss = elewise_mean_loss.mean()
-        actual_ks_loss = (actual_kl_loss + actual_mean_loss).mean()
+        actual_ks_loss = actual_mean_loss.mean()
 
-    vae_loss = recon_loss * 0.0 + total_loss * 1.0
+    vae_loss = recon_loss * 0.5 + total_loss * 1.0
     return vae_loss, {
         "recon_loss": recon_loss.item(),
         "kl_loss": actual_ks_loss.item(),
         "average_of_abs_z": z.abs().mean().item(),
         "std_of_abs_z": z.abs().std().item(),
-        "average_of_logvar": logvar.mean().item(),
-        "std_of_logvar": logvar.std().item(),
+        "average_of_logvar": 0.0,
+        "std_of_logvar": 0.0,
     }
 
 
@@ -182,9 +207,7 @@ def cleanup():
 @click.option(
     "--evaluate_every_n_steps", type=int, default=250, help="Evaluate every n steps"
 )
-@click.option(
-    "--load_path", type=str, default=None, help="Path to load the model from"
-)
+@click.option("--load_path", type=str, default=None, help="Path to load the model from")
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -213,7 +236,7 @@ def train_ddp(
     random.seed(42)
 
     start_train = 0
-    end_train = 128 * 10
+    end_train = 128 * 16
 
     start_test = end_train + 1
     end_test = start_test + 8
@@ -263,6 +286,7 @@ def train_ddp(
     ).cuda()
 
     discriminator = PatchDiscriminator().cuda()
+    discriminator.requires_grad_(True)
 
     vae = DDP(vae, device_ids=[ddp_rank])
     # vae = torch.compile(vae, fullgraph=False, mode='reduce-overhead')
@@ -282,9 +306,10 @@ def train_ddp(
         weight_decay=1e-3,
         betas=(0.9, 0.95),
     )
+
     optimizer_D = optim.AdamW(
         discriminator.parameters(),
-        lr=learning_rate_disc / vae_ch,
+        lr=learning_rate_disc,
         weight_decay=1e-3,
         betas=(0.9, 0.95),
     )
@@ -316,9 +341,11 @@ def train_ddp(
         logger.addHandler(handler)
 
     global_step = 0
-    
+
     if load_path is not None:
-        vae.load_state_dict(torch.load(load_path, map_location='cpu'))
+        state_dict = torch.load(load_path, map_location="cpu")
+        status = vae.load_state_dict(state_dict, strict=False)
+        print(status)
 
     for epoch in range(num_epochs):
         for i, real_images in enumerate(dataloader):
@@ -332,29 +359,36 @@ def train_ddp(
             if do_ganloss:
                 real_preds = discriminator(real_images)
                 fake_preds = discriminator(reconstructed.detach())
-                d_loss = gan_disc_loss(real_preds, fake_preds).mean()
+                d_loss, avg_real_logits, avg_fake_logits = gan_disc_loss(
+                    real_preds, fake_preds
+                )
+                d_loss = d_loss.mean()
                 d_loss.backward(retain_graph=True)
+
+                avg_real_logits = avg_scalar_over_nodes(avg_real_logits, device)
+                avg_fake_logits = avg_scalar_over_nodes(avg_fake_logits, device)
 
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
-           
+
             percep_rec_loss = lpips(_recon_for_perceptual, real_images).mean()
 
             # mse, vae loss.
             recon_for_mse = gradnorm(reconstructed)
             vae_loss, loss_data = vae_loss_function(real_images, recon_for_mse, z)
             # gan loss
-            if do_ganloss:
+            if do_ganloss and global_step >= 20:
                 recon_for_gan = gradnorm(reconstructed)
                 fake_preds = discriminator(recon_for_gan)
-                fake_criterion = nn.functional.binary_cross_entropy_with_logits(
-                    fake_preds, torch.ones_like(fake_preds)
-                )
-                gan_loss_value = fake_criterion.mean()
+                real_preds_const = real_preds.clone().detach()
+                # loss where (real > fake + 0.01)
+                g_gan_loss = (real_preds_const - fake_preds - 0.1).relu().mean()
 
-                overall_vae_loss = percep_rec_loss + gan_loss_value + vae_loss
+                overall_vae_loss = percep_rec_loss + g_gan_loss + vae_loss
+                g_gan_loss = g_gan_loss.item()
             else:
                 overall_vae_loss = percep_rec_loss + vae_loss
+                g_gan_loss = 0.0
 
             overall_vae_loss.backward()
             optimizer_G.step()
@@ -375,10 +409,12 @@ def train_ddp(
                         "mse_loss": loss_data["recon_loss"],
                         "kl_loss": loss_data["kl_loss"],
                         "perceptual_loss": percep_rec_loss.item(),
-                        "gan_loss": gan_loss_value.item() if do_ganloss else None,
+                        "gan_loss": g_gan_loss if do_ganloss else None,
                         "abs_mu": loss_data["average_of_abs_z"],
                         "std_mu": loss_data["std_of_abs_z"],
                         "abs_logvar": loss_data["average_of_logvar"],
+                        "avg_real_logits": avg_real_logits,
+                        "avg_fake_logits": avg_fake_logits,
                     }
                 )
 
@@ -414,7 +450,9 @@ def train_ddp(
                 if do_ganloss:
                     log_items = [
                         ("d_loss", d_loss.item()),
-                        ("gan_loss", gan_loss_value.item()),
+                        ("gan_loss", g_gan_loss),
+                        ("avg_real_logits", avg_real_logits),
+                        ("avg_fake_logits", avg_fake_logits),
                     ] + log_items
 
                 log_message += "\n\t".join(
@@ -433,7 +471,7 @@ def train_ddp(
                 with torch.no_grad():
                     all_test_images = []
                     all_reconstructed_test = []
-                    
+
                     for test_images in test_dataloader:
                         test_images = test_images[0].to(device)
                         reconstructed_test, _ = vae(test_images)
@@ -441,36 +479,45 @@ def train_ddp(
                         # unnormalize the images
                         test_images = test_images * 0.5 + 0.5
                         reconstructed_test = reconstructed_test * 0.5 + 0.5
-                        
+                        # clamp
+                        test_images = test_images.clamp(0, 1)
+                        reconstructed_test = reconstructed_test.clamp(0, 1)
+
                         all_test_images.append(test_images)
                         all_reconstructed_test.append(reconstructed_test)
-                        
+
                         if len(all_test_images) >= 2:
                             break
-                        
+
                     test_images = torch.cat(all_test_images, dim=0)
                     reconstructed_test = torch.cat(all_reconstructed_test, dim=0)
 
-                    logger.info(
-                        f"Epoch [{epoch}/{num_epochs}] - Logging test images"
-                    )
-                    
+                    logger.info(f"Epoch [{epoch}/{num_epochs}] - Logging test images")
+
                     # crop test and recon to 64 x 64
                     D = 128
                     offset = 0
-                    test_images = test_images[:, :, offset:offset+D, offset:offset+D].cpu()   
-                    reconstructed_test = reconstructed_test[:, :, offset:offset+D, offset:offset+D].cpu()
-                    
+                    test_images = test_images[
+                        :, :, offset : offset + D, offset : offset + D
+                    ].cpu()
+                    reconstructed_test = reconstructed_test[
+                        :, :, offset : offset + D, offset : offset + D
+                    ].cpu()
+
                     # concat the images into one large image.
                     # make size of (D * 4) x (D * 4)
                     recon_all_image = torch.zeros((3, D * 4, D * 4))
                     test_all_image = torch.zeros((3, D * 4, D * 4))
-                    
+
                     for i in range(4):
                         for j in range(4):
-                            recon_all_image[:, i * D:(i+1) * D, j * D:(j+1) * D] = reconstructed_test[i * 4 + j]
-                            test_all_image[:, i * D:(i+1) * D, j * D:(j+1) * D] = test_images[i * 4 + j]
-                            
+                            recon_all_image[
+                                :, i * D : (i + 1) * D, j * D : (j + 1) * D
+                            ] = reconstructed_test[i * 4 + j]
+                            test_all_image[
+                                :, i * D : (i + 1) * D, j * D : (j + 1) * D
+                            ] = test_images[i * 4 + j]
+
                     wandb.log(
                         {
                             "reconstructed_test_images": [
@@ -484,16 +531,17 @@ def train_ddp(
 
                     os.makedirs(f"./ckpt/{run_name}", exist_ok=True)
                     torch.save(
-                        vae.state_dict(), f"./ckpt/{run_name}/vae_epoch_{epoch}_step_{global_step}.pt"
+                        vae.state_dict(),
+                        f"./ckpt/{run_name}/vae_epoch_{epoch}_step_{global_step}.pt",
                     )
-                    print(f"Saved checkpoint to ./ckpt/{run_name}/vae_epoch_{epoch}_step_{global_step}.pt")
+                    print(
+                        f"Saved checkpoint to ./ckpt/{run_name}/vae_epoch_{epoch}_step_{global_step}.pt"
+                    )
 
     cleanup()
 
 
 if __name__ == "__main__":
 
-    #  torchrun --nproc_per_node=8 vae_trainer.py
+    # Example: torchrun --nproc_per_node=8 vae_trainer.py
     train_ddp()
-
-    # train_ddp(dataset_url, test_dataset_url)
