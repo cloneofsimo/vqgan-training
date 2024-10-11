@@ -2,6 +2,10 @@
 
 The famous VAE of latent diffusion models, such as stable diffusion, FLUX, SORA, etc. How are they trained? This is my attempt to write distributed VAE trainer. It is largely based on [LDM's VAE](https://arxiv.org/abs/2112.10752)
 
+<p align="center">
+<img src="contents/origin.png" alt="origin" width="300"/>
+<img src="contents/recon.png" alt="recon" width="300"/>
+</p>
 
 ## Details
 
@@ -23,7 +27,7 @@ $$L_{GAN} = \max(0, D(x) - D(\hat{x}) - 0.1)$$
 $$ \nabla_{\theta} L = \frac{1}{|\nabla_{X} L_{GAN}|} \nabla_{\theta} L_{GAN} + \frac{1}{|\nabla_{X} L_{percep}|} \nabla_{\theta} L_{percep} $$
 
    where $\nabla_{X}$ denotes the gradient with respect to input. This method is implemented using a custom autograd function, modifying the backward pass while preserving the forward pass. You can use it as follows:
-   
+
 ```python
 class GradNormFunction(torch.autograd.Function):
     @staticmethod
