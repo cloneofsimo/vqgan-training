@@ -33,8 +33,7 @@ class GradNormFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
 
         grad_output_norm = torch.linalg.norm(grad_output, dim=0, keepdim=True)
-        # print(grad_output_norm.shape)
-
+    
         grad_output_normalized = grad_output / (grad_output_norm + 1e-8)
 
         return grad_output_normalized
@@ -143,9 +142,7 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True):
     )
 
     elewise_mean_loss = z.pow(2)
-    modified_mean_loss = soft_large_penalty(elewise_mean_loss, threshold=0.4)
-
-    total_loss = modified_mean_loss.mean()
+    total_loss = elewise_mean_loss.mean()
 
     with torch.no_grad():
         actual_mean_loss = elewise_mean_loss.mean()

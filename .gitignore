@@ -5,4 +5,3 @@ __pycache__
 vgg.pth
 *_tester.ipynb
 ckpt
-*.png
