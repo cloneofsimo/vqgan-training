@@ -11,7 +11,7 @@ The VAE architecture is based on the one used in latent diffusion models, with s
 
 2. **GAN Loss**: Incorporates GAN loss for enhanced image quality. A pretrained VGG16 backbone with a simple linear convolutional layer atop 16 feature maps serves as the discriminator. The hinge loss is employed for GAN loss, with a thresholding technique to stabilize training:
 
-   $$ L_{GAN} = \max(0, D(x) - D(\hat{x}) - 0.1) $$
+$$L_{GAN} = \max(0, D(x) - D(\hat{x}) - 0.1)$$
 
    where $x$ is the input and $\hat{x} = \text{Dec}(\text{Enc}(x))$ is the reconstructed image.
 
@@ -19,7 +19,7 @@ The VAE architecture is based on the one used in latent diffusion models, with s
 
 4. **Gradient Normalization**: Implements gradient normalization for stable training, offering a simpler alternative to rebalancing via autograd mechanism modification. This approach normalizes gradients to address potential imbalances between loss components:
 
-   $$ \nabla_{\theta} L = \frac{1}{|\nabla_{X} L_{GAN}|} \nabla_{\theta} L_{GAN} + \frac{1}{|\nabla_{X} L_{percep}|} \nabla_{\theta} L_{percep} $$
+$$ \nabla_{\theta} L = \frac{1}{|\nabla_{X} L_{GAN}|} \nabla_{\theta} L_{GAN} + \frac{1}{|\nabla_{X} L_{percep}|} \nabla_{\theta} L_{percep} $$
 
    where $\nabla_{X}$ denotes the gradient with respect to input. This method is implemented using a custom autograd function, modifying the backward pass while preserving the forward pass.
 
@@ -57,10 +57,10 @@ x = gradnorm(x) # x.grad is now normalized to have unit norm.
 
 The following images illustrate an example of the filtered result:
 
-<center>
+<p align="center">
 <img src="contents/ti2.png" alt="filtered" width="200"/>
 <img src="contents/ti2_mask.png" alt="filtered" width="200"/>
-</center>
+</p>
 
 
 - `ae.py`: Contains the VAE architecture implementation.
