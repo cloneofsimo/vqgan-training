@@ -25,22 +25,24 @@ from utils import LPIPS, PatchDiscriminator
 
 class GradNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x):
-
+    def forward(ctx, x, weight):
+        ctx.save_for_backward(weight)
         return x.clone()
 
     @staticmethod
     def backward(ctx, grad_output):
+        weight = ctx.saved_tensors[0]
 
         grad_output_norm = torch.linalg.norm(grad_output, dim=0, keepdim=True)
-    
-        grad_output_normalized = grad_output / (grad_output_norm + 1e-8)
 
-        return grad_output_normalized
+        grad_output_normalized = weight * grad_output / (grad_output_norm + 1e-8)
+
+        return grad_output_normalized, None
 
 
-def gradnorm(x):
-    return GradNormFunction.apply(x)
+def gradnorm(x, weight=1.0):
+    weight = torch.tensor(weight, device=x.device)
+    return GradNormFunction.apply(x, weight)
 
 
 def avg_scalar_over_nodes(value: float, device):
@@ -130,16 +132,17 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True):
     # downsample images by factor of 8
     if do_pool:
         x_reconstructed_down = F.interpolate(
-            x_reconstructed, scale_factor=1 / 4, mode="area"
+            x_reconstructed, scale_factor=1 / 16, mode="area"
         )
-        x_down = F.interpolate(x, scale_factor=1 / 4, mode="area")
+        x_down = F.interpolate(x, scale_factor=1 / 16, mode="area")
+        recon_loss = ((x_reconstructed_down - x_down)).abs().mean()
     else:
         x_reconstructed_down = x_reconstructed
         x_down = x
 
-    recon_loss = (
-        ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down)).abs().mean()
-    )
+        recon_loss = (
+            ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down)).abs().mean()
+        )
 
     elewise_mean_loss = z.pow(2)
     total_loss = elewise_mean_loss.mean()
@@ -148,7 +151,7 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True):
         actual_mean_loss = elewise_mean_loss.mean()
         actual_ks_loss = actual_mean_loss.mean()
 
-    vae_loss = recon_loss * 0.5 + total_loss * 1.0
+    vae_loss = recon_loss * 1.0 + total_loss * 1.0
     return vae_loss, {
         "recon_loss": recon_loss.item(),
         "kl_loss": actual_ks_loss.item(),
@@ -205,6 +208,7 @@ def cleanup():
     "--evaluate_every_n_steps", type=int, default=250, help="Evaluate every n steps"
 )
 @click.option("--load_path", type=str, default=None, help="Path to load the model from")
+@click.option("--do_clamp", is_flag=True, help="Whether to clamp the latent codes")
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -223,6 +227,7 @@ def train_ddp(
     max_steps,
     evaluate_every_n_steps,
     load_path,
+    do_clamp,
 ):
 
     # fix random seed
@@ -254,7 +259,7 @@ def train_ddp(
 
     if master_process:
         wandb.init(
-            project="vae-gan-ddp-large",
+            project="vae-gan-ddp-large-flip",
             entity="simo",
             name=run_name,
             config={
@@ -286,8 +291,18 @@ def train_ddp(
     discriminator.requires_grad_(True)
 
     vae = DDP(vae, device_ids=[ddp_rank])
-    # vae = torch.compile(vae, fullgraph=False, mode='reduce-overhead')
+
+    vae.module.encoder = torch.compile(
+        vae.module.encoder, fullgraph=False, mode="reduce-overhead"
+    )
+    vae.module.decoder = torch.compile(
+        vae.module.decoder, fullgraph=False, mode="reduce-overhead"
+    )
+
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
+
+    # context
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     optimizer_G = optim.AdamW(
         [
@@ -348,7 +363,45 @@ def train_ddp(
         for i, real_images in enumerate(dataloader):
 
             real_images = real_images[0].to(device)
-            reconstructed, z = vae(real_images)
+            z = vae.module.encoder(real_images)
+
+            # z distribution
+            with ctx:
+                z_dist_value: torch.Tensor = z.detach().cpu().reshape(-1)
+
+            def kurtosis(x):
+                return ((x - x.mean()) ** 4).mean() / (x.std() ** 4)
+
+            def skew(x):
+                return ((x - x.mean()) ** 3).mean() / (x.std() ** 3)
+
+            z_quantiles = {
+                "0.0": z_dist_value.quantile(0.0),
+                "0.2": z_dist_value.quantile(0.2),
+                "0.4": z_dist_value.quantile(0.4),
+                "0.6": z_dist_value.quantile(0.6),
+                "0.8": z_dist_value.quantile(0.8),
+                "1.0": z_dist_value.quantile(1.0),
+                "kurtosis": kurtosis(z_dist_value),
+                "skewness": skew(z_dist_value),
+            }
+
+            if do_clamp:
+                z = z.clamp(-8.0, 8.0)
+            z_s = vae.module.reg(z)
+
+            if random.random() < 0.5:
+                z_s = torch.flip(z_s, [-1])
+                z_s[:, -4:-2] = -z_s[:, -4:-2]
+                real_images = torch.flip(real_images, [-1])
+
+            if random.random() < 0.5:
+                z_s = torch.flip(z_s, [-2])
+                z_s[:, -2:] = -z_s[:, -2:]
+                real_images = torch.flip(real_images, [-2])
+
+            with ctx:
+                reconstructed = vae.module.decoder(z_s)
 
             if global_step >= max_steps:
                 break
@@ -371,7 +424,7 @@ def train_ddp(
             percep_rec_loss = lpips(_recon_for_perceptual, real_images).mean()
 
             # mse, vae loss.
-            recon_for_mse = gradnorm(reconstructed)
+            recon_for_mse = gradnorm(reconstructed, weight=0.2)
             vae_loss, loss_data = vae_loss_function(real_images, recon_for_mse, z)
             # gan loss
             if do_ganloss and global_step >= 20:
@@ -397,23 +450,33 @@ def train_ddp(
                 optimizer_D.zero_grad()
 
             if master_process:
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "batch": i,
-                        "d_loss": d_loss.item() if do_ganloss else None,
-                        "overall_vae_loss": overall_vae_loss.item(),
-                        "mse_loss": loss_data["recon_loss"],
-                        "kl_loss": loss_data["kl_loss"],
-                        "perceptual_loss": percep_rec_loss.item(),
-                        "gan_loss": g_gan_loss if do_ganloss else None,
-                        "abs_mu": loss_data["average_of_abs_z"],
-                        "std_mu": loss_data["std_of_abs_z"],
-                        "abs_logvar": loss_data["average_of_logvar"],
-                        "avg_real_logits": avg_real_logits,
-                        "avg_fake_logits": avg_fake_logits,
-                    }
-                )
+                if global_step % 5 == 0:
+                    wandb.log(
+                        {
+                            "epoch": epoch,
+                            "batch": i,
+                            "gan/discriminator_loss": (
+                                d_loss.item() if do_ganloss else None
+                            ),
+                            "overall_vae_loss": overall_vae_loss.item(),
+                            "mse_loss": loss_data["recon_loss"],
+                            "kl_loss": loss_data["kl_loss"],
+                            "perceptual_loss": percep_rec_loss.item(),
+                            "gan/generator_gan_loss": (
+                                g_gan_loss if do_ganloss else None
+                            ),
+                            "z_quantiles/abs_z": loss_data["average_of_abs_z"],
+                            "z_quantiles/std_z": loss_data["std_of_abs_z"],
+                            "z_quantiles/logvar": loss_data["average_of_logvar"],
+                            "gan/avg_real_logits": (
+                                avg_real_logits if do_ganloss else None
+                            ),
+                            "gan/avg_fake_logits": (
+                                avg_fake_logits if do_ganloss else None
+                            ),
+                            "z_quantiles/qs": z_quantiles,
+                        }
+                    )
 
                 if global_step % 200 == 0:
 
@@ -442,6 +505,7 @@ def train_ddp(
                         loss_data["average_of_logvar"],
                     ),
                     ("STD logvar : std_of_logvar", loss_data["std_of_logvar"]),
+                    *[(f"z_quantiles/{q}", v) for q, v in z_quantiles.items()],
                 ]
 
                 if do_ganloss:
@@ -471,7 +535,26 @@ def train_ddp(
 
                     for test_images in test_dataloader:
                         test_images = test_images[0].to(device)
-                        reconstructed_test, _ = vae(test_images)
+                        z = vae.module.encoder(test_images)
+
+                        if do_clamp:
+                            z = z.clamp(-8.0, 8.0)
+
+                        z_s = vae.module.reg(z)
+
+                        # [1, 2]
+                        # [3, 4]
+                        # ->
+                        # [3, 4]
+                        # [1, 2]
+                        # ->
+                        # [4, 3]
+                        # [2, 1]
+
+                        z_s = torch.flip(z_s, [-1, -2])
+                        z_s[:, -4:] = -z_s[:, -4:]
+
+                        reconstructed_test = vae.module.decoder(z_s)
 
                         # unnormalize the images
                         test_images = test_images * 0.5 + 0.5
@@ -479,6 +562,9 @@ def train_ddp(
                         # clamp
                         test_images = test_images.clamp(0, 1)
                         reconstructed_test = reconstructed_test.clamp(0, 1)
+
+                        # flip twice
+                        reconstructed_test = torch.flip(reconstructed_test, [-1, -2])
 
                         all_test_images.append(test_images)
                         all_reconstructed_test.append(reconstructed_test)
@@ -492,7 +578,7 @@ def train_ddp(
                     logger.info(f"Epoch [{epoch}/{num_epochs}] - Logging test images")
 
                     # crop test and recon to 64 x 64
-                    D = 128
+                    D = 256
                     offset = 0
                     test_images = test_images[
                         :, :, offset : offset + D, offset : offset + D
