@@ -67,17 +67,19 @@ def gan_disc_loss(real_preds, fake_preds):
     return real_loss + fake_loss, avg_real_preds, avg_fake_preds
 
 
+MAX_WIDTH = 512
+
 this_transform = transforms.Compose(
     [
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         transforms.CenterCrop(512),
-        transforms.Resize(256),
+        transforms.Resize(MAX_WIDTH),
     ]
 )
 
 
-def this_transform_random_crop_resize(x, width=256):
+def this_transform_random_crop_resize(x, width=MAX_WIDTH):
 
     x = transforms.ToTensor()(x)
     x = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(x)
@@ -245,10 +247,28 @@ def cleanup():
     "--do_attn", type=bool, default=False, help="Whether to use attention in the VAE"
 )
 @click.option(
+    "--decoder_also_perform_hr",
+    type=bool,
+    default=False,
+    help="Whether to perform HR decoding in the decoder",
+)
+@click.option(
     "--project_name",
     type=str,
     default="vae_sweep_attn_lr_width",
     help="Project name for wandb",
+)
+@click.option(
+    "--crop_invariance",
+    type=bool,
+    default=False,
+    help="Whether to perform crop invariance",
+)
+@click.option(
+    "--do_compile",
+    type=bool,
+    default=False,
+    help="Whether to compile the model",
 )
 def train_ddp(
     dataset_url,
@@ -272,7 +292,10 @@ def train_ddp(
     clamp_th,
     max_spatial_dim,
     do_attn,
+    decoder_also_perform_hr,
     project_name,
+    crop_invariance,
+    do_compile,
 ):
 
     # fix random seed
@@ -332,6 +355,7 @@ def train_ddp(
         num_res_blocks=vae_num_res_blocks,
         z_channels=vae_z_channels,
         use_attn=do_attn,
+        decoder_also_perform_hr=decoder_also_perform_hr,
     ).cuda()
 
     discriminator = PatchDiscriminator().cuda()
@@ -339,12 +363,13 @@ def train_ddp(
 
     vae = DDP(vae, device_ids=[ddp_rank])
 
-    # vae.module.encoder = torch.compile(
-    #     vae.module.encoder, fullgraph=False, mode="reduce-overhead"
-    # )
-    # vae.module.decoder = torch.compile(
-    #     vae.module.decoder, fullgraph=False, mode="reduce-overhead"
-    # )
+    if do_compile:
+        vae.module.encoder = torch.compile(
+            vae.module.encoder, fullgraph=False, mode="reduce-overhead"
+        )
+        vae.module.decoder = torch.compile(
+            vae.module.decoder, fullgraph=False, mode="reduce-overhead"
+        )
 
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
 
@@ -410,10 +435,15 @@ def train_ddp(
         print(status)
 
     for epoch in range(num_epochs):
-        for i, real_images in enumerate(dataloader):
+        for i, real_images_hr in enumerate(dataloader):
 
-            real_images = real_images[0].to(device)
-            z = vae.module.encoder(real_images)
+            # resize real image to 256
+            real_images_hr = real_images_hr[0].to(device)
+            real_images_for_enc = F.interpolate(
+                real_images_hr, size=(256, 256), mode="area"
+            )
+
+            z = vae.module.encoder(real_images_for_enc)
 
             # z distribution
             with ctx:
@@ -445,26 +475,30 @@ def train_ddp(
             if random.random() < 0.5:
                 z_s = torch.flip(z_s, [-1])
                 z_s[:, -4:-2] = -z_s[:, -4:-2]
-                real_images = torch.flip(real_images, [-1])
+                real_images_hr = torch.flip(real_images_hr, [-1])
 
             if random.random() < 0.5:
                 z_s = torch.flip(z_s, [-2])
                 z_s[:, -2:] = -z_s[:, -2:]
-                real_images = torch.flip(real_images, [-2])
+                real_images_hr = torch.flip(real_images_hr, [-2])
 
-            if random.random() < 0.5:
+            if random.random() < 0.5 and crop_invariance:
                 # crop image and latent.'
                 new_z_h = random.randint(8, max_spatial_dim // 8 - 1)
                 new_z_w = random.randint(8, max_spatial_dim // 8 - 1)
                 offset_z_h = random.randint(0, max_spatial_dim // 8 - new_z_h - 1)
                 offset_z_w = random.randint(0, max_spatial_dim // 8 - new_z_w - 1)
 
-                new_h = new_z_h * 8
-                new_w = new_z_w * 8
-                offset_h = offset_z_h * 8
-                offset_w = offset_z_w * 8
+                new_h = new_z_h * 8 * 2 if decoder_also_perform_hr else new_z_h * 8
+                new_w = new_z_w * 8 * 2 if decoder_also_perform_hr else new_z_w * 8
+                offset_h = (
+                    offset_z_h * 8 * 2 if decoder_also_perform_hr else offset_z_h * 8
+                )
+                offset_w = (
+                    offset_z_w * 8 * 2 if decoder_also_perform_hr else offset_z_w * 8
+                )
 
-                real_images = real_images[
+                real_images_hr = real_images_hr[
                     :, :, offset_h : offset_h + new_h, offset_w : offset_w + new_w
                 ]
                 z_s = z_s[
@@ -474,8 +508,8 @@ def train_ddp(
                     offset_z_w : offset_z_w + new_z_w,
                 ]
 
-                assert real_images.shape[-2] == new_h
-                assert real_images.shape[-1] == new_w
+                assert real_images_hr.shape[-2] == new_h
+                assert real_images_hr.shape[-1] == new_w
                 assert z_s.shape[-2] == new_z_h
                 assert z_s.shape[-1] == new_z_w
 
@@ -486,7 +520,7 @@ def train_ddp(
                 break
 
             if do_ganloss:
-                real_preds = discriminator(real_images)
+                real_preds = discriminator(real_images_hr)
                 fake_preds = discriminator(reconstructed.detach())
                 d_loss, avg_real_logits, avg_fake_logits = gan_disc_loss(
                     real_preds, fake_preds
@@ -500,11 +534,11 @@ def train_ddp(
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
 
-            percep_rec_loss = lpips(_recon_for_perceptual, real_images).mean()
+            percep_rec_loss = lpips(_recon_for_perceptual, real_images_hr).mean()
 
             # mse, vae loss.
             recon_for_mse = gradnorm(reconstructed, weight=0.001)
-            vae_loss, loss_data = vae_loss_function(real_images, recon_for_mse, z)
+            vae_loss, loss_data = vae_loss_function(real_images_hr, recon_for_mse, z)
             # gan loss
             if do_ganloss and global_step >= 20:
                 recon_for_gan = gradnorm(reconstructed)
@@ -613,7 +647,11 @@ def train_ddp(
                     all_reconstructed_test = []
 
                     for test_images in test_dataloader:
-                        test_images = test_images[0].to(device)
+                        test_images_ori = test_images[0].to(device)
+                        # resize to 256
+                        test_images = F.interpolate(
+                            test_images_ori, size=(256, 256), mode="area"
+                        )
                         z = vae.module.encoder(test_images)
 
                         if do_clamp:
@@ -636,16 +674,16 @@ def train_ddp(
                         reconstructed_test = vae.module.decoder(z_s)
 
                         # unnormalize the images
-                        test_images = test_images * 0.5 + 0.5
+                        test_images_ori = test_images_ori * 0.5 + 0.5
                         reconstructed_test = reconstructed_test * 0.5 + 0.5
                         # clamp
-                        test_images = test_images.clamp(0, 1)
+                        test_images_ori = test_images_ori.clamp(0, 1)
                         reconstructed_test = reconstructed_test.clamp(0, 1)
 
                         # flip twice
                         reconstructed_test = torch.flip(reconstructed_test, [-1, -2])
 
-                        all_test_images.append(test_images)
+                        all_test_images.append(test_images_ori)
                         all_reconstructed_test.append(reconstructed_test)
 
                         if len(all_test_images) >= 2:
@@ -657,7 +695,7 @@ def train_ddp(
                     logger.info(f"Epoch [{epoch}/{num_epochs}] - Logging test images")
 
                     # crop test and recon to 64 x 64
-                    D = 256
+                    D = 512 if decoder_also_perform_hr else 256
                     offset = 0
                     test_images = test_images[
                         :, :, offset : offset + D, offset : offset + D

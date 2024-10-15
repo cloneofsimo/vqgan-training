@@ -274,6 +274,7 @@ class VAE(nn.Module):
         num_res_blocks,
         z_channels,
         use_attn,
+        decoder_also_perform_hr,
     ):
         super().__init__()
         self.encoder = Encoder(
@@ -290,7 +291,7 @@ class VAE(nn.Module):
             in_channels=in_channels,
             ch=ch,
             out_ch=out_ch,
-            ch_mult=ch_mult,
+            ch_mult=ch_mult + [4] if decoder_also_perform_hr else ch_mult,
             num_res_blocks=num_res_blocks,
             z_channels=z_channels,
             use_attn=use_attn,
@@ -314,47 +315,51 @@ if __name__ == "__main__":
         num_res_blocks=2,
         z_channels=16,
         use_attn=False,
+        decoder_also_perform_hr=True,
     )
     vae.eval().to("cuda")
     x = torch.randn(1, 3, 256, 256).to("cuda")
-    # decz, z = vae(x)
-    # print(decz.shape, z.shape)
-    from unit_activation_reinitializer import adjust_weight_init
-    from torchvision import transforms
-    import torchvision
+    decz, z = vae(x)
+    print(decz.shape, z.shape)
 
-    train_dataset = torchvision.datasets.CIFAR10(
-        root="./data",
-        train=True,
-        download=True,
-        transform=transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        ),
-    )
+    # do de
 
-    initial_std, layer_weight_std = adjust_weight_init(
-        vae,
-        dataset=train_dataset,
-        device="cuda:0",
-        batch_size=64,
-        num_workers=0,
-        tol=0.1,
-        max_iters=10,
-        exclude_layers=[nn.GroupNorm, nn.LayerNorm],
-    )
+    # from unit_activation_reinitializer import adjust_weight_init
+    # from torchvision import transforms
+    # import torchvision
 
-    # save initial_std and layer_weight_std
-    torch.save(initial_std, "initial_std.pth")
-    torch.save(layer_weight_std, "layer_weight_std.pth")
+    # train_dataset = torchvision.datasets.CIFAR10(
+    #     root="./data",
+    #     train=True,
+    #     download=True,
+    #     transform=transforms.Compose(
+    #         [
+    #             transforms.Resize((256, 256)),
+    #             transforms.ToTensor(),
+    #             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    #         ]
+    #     ),
+    # )
 
-    print("\nAdjusted Weight Standard Deviations. Before -> After:")
-    for layer_name, std in layer_weight_std.items():
-        print(
-            f"Layer {layer_name}, Changed STD from \n   {initial_std[layer_name]:.4f} -> STD {std:.4f}\n"
-        )
+    # initial_std, layer_weight_std = adjust_weight_init(
+    #     vae,
+    #     dataset=train_dataset,
+    #     device="cuda:0",
+    #     batch_size=64,
+    #     num_workers=0,
+    #     tol=0.1,
+    #     max_iters=10,
+    #     exclude_layers=[nn.GroupNorm, nn.LayerNorm],
+    # )
 
-    print(layer_weight_std)
+    # # save initial_std and layer_weight_std
+    # torch.save(initial_std, "initial_std.pth")
+    # torch.save(layer_weight_std, "layer_weight_std.pth")
+
+    # print("\nAdjusted Weight Standard Deviations. Before -> After:")
+    # for layer_name, std in layer_weight_std.items():
+    #     print(
+    #         f"Layer {layer_name}, Changed STD from \n   {initial_std[layer_name]:.4f} -> STD {std:.4f}\n"
+    #     )
+
+    # print(layer_weight_std)
