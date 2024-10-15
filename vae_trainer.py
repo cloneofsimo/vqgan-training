@@ -33,7 +33,9 @@ class GradNormFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         weight = ctx.saved_tensors[0]
 
-        grad_output_norm = torch.linalg.norm(grad_output, dim=0, keepdim=True)
+        grad_output_norm = torch.linalg.vector_norm(
+            grad_output, dim=list(range(1, len(grad_output.shape))), keepdim=True
+        )
 
         grad_output_normalized = weight * grad_output / (grad_output_norm + 1e-8)
 
@@ -69,18 +71,39 @@ this_transform = transforms.Compose(
     [
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        transforms.CenterCrop(256),
+        transforms.CenterCrop(512),
+        transforms.Resize(256),
     ]
 )
 
 
-def create_dataloader(url, batch_size, num_workers, do_shuffle=True):
+def this_transform_random_crop_resize(x, width=256):
+
+    x = transforms.ToTensor()(x)
+    x = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(x)
+
+    if random.random() < 0.5:
+        x = transforms.RandomCrop(width)(x)
+    else:
+        x = transforms.Resize(width)(x)
+        x = transforms.RandomCrop(width)(x)
+
+    return x
+
+
+def create_dataloader(url, batch_size, num_workers, do_shuffle=True, just_resize=False):
     dataset = wds.WebDataset(
         url, nodesplitter=wds.split_by_node, workersplitter=wds.split_by_worker
     )
     dataset = dataset.shuffle(1000) if do_shuffle else dataset
 
-    dataset = dataset.decode("rgb").to_tuple("jpg;png").map_tuple(this_transform)
+    dataset = (
+        dataset.decode("rgb")
+        .to_tuple("jpg;png")
+        .map_tuple(
+            this_transform_random_crop_resize if not just_resize else this_transform
+        )
+    )
 
     loader = wds.WebLoader(
         dataset,
@@ -145,13 +168,13 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True):
         )
 
     elewise_mean_loss = z.pow(2)
-    total_loss = elewise_mean_loss.mean()
+    zloss = elewise_mean_loss.mean()
 
     with torch.no_grad():
         actual_mean_loss = elewise_mean_loss.mean()
         actual_ks_loss = actual_mean_loss.mean()
 
-    vae_loss = recon_loss * 1.0 + total_loss * 1.0
+    vae_loss = recon_loss * 0.0 + zloss * 1.0
     return vae_loss, {
         "recon_loss": recon_loss.item(),
         "kl_loss": actual_ks_loss.item(),
@@ -209,6 +232,9 @@ def cleanup():
 )
 @click.option("--load_path", type=str, default=None, help="Path to load the model from")
 @click.option("--do_clamp", is_flag=True, help="Whether to clamp the latent codes")
+@click.option(
+    "--clamp_th", type=float, default=8.0, help="Clamp threshold for the latent codes"
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -228,6 +254,7 @@ def train_ddp(
     evaluate_every_n_steps,
     load_path,
     do_clamp,
+    clamp_th,
 ):
 
     # fix random seed
@@ -332,7 +359,7 @@ def train_ddp(
         dataset_url, batch_size, num_workers=4, do_shuffle=True
     )
     test_dataloader = create_dataloader(
-        test_dataset_url, batch_size, num_workers=4, do_shuffle=False
+        test_dataset_url, batch_size, num_workers=4, do_shuffle=False, just_resize=True
     )
 
     num_training_steps = max_steps
@@ -356,6 +383,9 @@ def train_ddp(
 
     if load_path is not None:
         state_dict = torch.load(load_path, map_location="cpu")
+        # state_dict = {
+        #     k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
+        # }
         status = vae.load_state_dict(state_dict, strict=False)
         print(status)
 
@@ -387,7 +417,7 @@ def train_ddp(
             }
 
             if do_clamp:
-                z = z.clamp(-8.0, 8.0)
+                z = z.clamp(-clamp_th, clamp_th)
             z_s = vae.module.reg(z)
 
             if random.random() < 0.5:
@@ -424,7 +454,7 @@ def train_ddp(
             percep_rec_loss = lpips(_recon_for_perceptual, real_images).mean()
 
             # mse, vae loss.
-            recon_for_mse = gradnorm(reconstructed, weight=0.2)
+            recon_for_mse = gradnorm(reconstructed, weight=0.001)
             vae_loss, loss_data = vae_loss_function(real_images, recon_for_mse, z)
             # gan loss
             if do_ganloss and global_step >= 20:
@@ -538,7 +568,7 @@ def train_ddp(
                         z = vae.module.encoder(test_images)
 
                         if do_clamp:
-                            z = z.clamp(-8.0, 8.0)
+                            z = z.clamp(-clamp_th, clamp_th)
 
                         z_s = vae.module.reg(z)
 
@@ -592,7 +622,7 @@ def train_ddp(
                     recon_all_image = torch.zeros((3, D * 4, D * 4))
                     test_all_image = torch.zeros((3, D * 4, D * 4))
 
-                    for i in range(4):
+                    for i in range(2):
                         for j in range(4):
                             recon_all_image[
                                 :, i * D : (i + 1) * D, j * D : (j + 1) * D

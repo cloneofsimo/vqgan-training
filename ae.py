@@ -255,7 +255,7 @@ class DiagonalGaussian(nn.Module):
     def forward(self, z: Tensor) -> Tensor:
         mean = z
         if self.sample:
-            std = 0.1
+            std = 0.00
             return mean * (1 + std * torch.randn_like(mean))
         else:
             return mean
