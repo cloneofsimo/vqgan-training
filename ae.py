@@ -121,6 +121,7 @@ class Encoder(nn.Module):
         ch_mult: list[int],
         num_res_blocks: int,
         z_channels: int,
+        use_attn: bool = True,
     ):
         super().__init__()
         self.ch = ch
@@ -153,7 +154,7 @@ class Encoder(nn.Module):
             self.down.append(down)
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.attn_1 = AttnBlock(block_in) if use_attn else nn.Identity()
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
         self.norm_out = nn.GroupNorm(
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
@@ -190,6 +191,7 @@ class Decoder(nn.Module):
         in_channels: int,
         resolution: int,
         z_channels: int,
+        use_attn: bool = True,
     ):
         super().__init__()
         self.ch = ch
@@ -206,7 +208,7 @@ class Decoder(nn.Module):
         )
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.attn_1 = AttnBlock(block_in) if use_attn else nn.Identity()
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
@@ -263,7 +265,15 @@ class DiagonalGaussian(nn.Module):
 
 class VAE(nn.Module):
     def __init__(
-        self, resolution, in_channels, ch, out_ch, ch_mult, num_res_blocks, z_channels
+        self,
+        resolution,
+        in_channels,
+        ch,
+        out_ch,
+        ch_mult,
+        num_res_blocks,
+        z_channels,
+        use_attn,
     ):
         super().__init__()
         self.encoder = Encoder(
@@ -273,6 +283,7 @@ class VAE(nn.Module):
             ch_mult=ch_mult,
             num_res_blocks=num_res_blocks,
             z_channels=z_channels,
+            use_attn=use_attn,
         )
         self.decoder = Decoder(
             resolution=resolution,
@@ -282,6 +293,7 @@ class VAE(nn.Module):
             ch_mult=ch_mult,
             num_res_blocks=num_res_blocks,
             z_channels=z_channels,
+            use_attn=use_attn,
         )
         self.reg = DiagonalGaussian()
 
@@ -301,8 +313,48 @@ if __name__ == "__main__":
         ch_mult=[1, 2, 4, 4],
         num_res_blocks=2,
         z_channels=16,
+        use_attn=False,
     )
     vae.eval().to("cuda")
     x = torch.randn(1, 3, 256, 256).to("cuda")
-    decz, z = vae(x)
-    print(decz.shape, z.shape)
+    # decz, z = vae(x)
+    # print(decz.shape, z.shape)
+    from unit_activation_reinitializer import adjust_weight_init
+    from torchvision import transforms
+    import torchvision
+
+    train_dataset = torchvision.datasets.CIFAR10(
+        root="./data",
+        train=True,
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+    )
+
+    initial_std, layer_weight_std = adjust_weight_init(
+        vae,
+        dataset=train_dataset,
+        device="cuda:0",
+        batch_size=64,
+        num_workers=0,
+        tol=0.1,
+        max_iters=10,
+        exclude_layers=[nn.GroupNorm, nn.LayerNorm],
+    )
+
+    # save initial_std and layer_weight_std
+    torch.save(initial_std, "initial_std.pth")
+    torch.save(layer_weight_std, "layer_weight_std.pth")
+
+    print("\nAdjusted Weight Standard Deviations. Before -> After:")
+    for layer_name, std in layer_weight_std.items():
+        print(
+            f"Layer {layer_name}, Changed STD from \n   {initial_std[layer_name]:.4f} -> STD {std:.4f}\n"
+        )
+
+    print(layer_weight_std)

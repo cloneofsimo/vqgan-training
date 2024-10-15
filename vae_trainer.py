@@ -235,6 +235,21 @@ def cleanup():
 @click.option(
     "--clamp_th", type=float, default=8.0, help="Clamp threshold for the latent codes"
 )
+@click.option(
+    "--max_spatial_dim",
+    type=int,
+    default=256,
+    help="Maximum spatial dimension for overall training",
+)
+@click.option(
+    "--do_attn", type=bool, default=False, help="Whether to use attention in the VAE"
+)
+@click.option(
+    "--project_name",
+    type=str,
+    default="vae_sweep_attn_lr_width",
+    help="Project name for wandb",
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -255,6 +270,9 @@ def train_ddp(
     load_path,
     do_clamp,
     clamp_th,
+    max_spatial_dim,
+    do_attn,
+    project_name,
 ):
 
     # fix random seed
@@ -286,7 +304,7 @@ def train_ddp(
 
     if master_process:
         wandb.init(
-            project="vae-gan-ddp-large-flip",
+            project=project_name,
             entity="simo",
             name=run_name,
             config={
@@ -301,6 +319,7 @@ def train_ddp(
                 "batch_size": batch_size,
                 "num_epochs": num_epochs,
                 "do_ganloss": do_ganloss,
+                "do_attn": do_attn,
             },
         )
 
@@ -312,6 +331,7 @@ def train_ddp(
         ch_mult=[int(x) for x in vae_ch_mult.split(",")],
         num_res_blocks=vae_num_res_blocks,
         z_channels=vae_z_channels,
+        use_attn=do_attn,
     ).cuda()
 
     discriminator = PatchDiscriminator().cuda()
@@ -319,12 +339,12 @@ def train_ddp(
 
     vae = DDP(vae, device_ids=[ddp_rank])
 
-    vae.module.encoder = torch.compile(
-        vae.module.encoder, fullgraph=False, mode="reduce-overhead"
-    )
-    vae.module.decoder = torch.compile(
-        vae.module.decoder, fullgraph=False, mode="reduce-overhead"
-    )
+    # vae.module.encoder = torch.compile(
+    #     vae.module.encoder, fullgraph=False, mode="reduce-overhead"
+    # )
+    # vae.module.decoder = torch.compile(
+    #     vae.module.decoder, fullgraph=False, mode="reduce-overhead"
+    # )
 
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
 
@@ -420,6 +440,8 @@ def train_ddp(
                 z = z.clamp(-clamp_th, clamp_th)
             z_s = vae.module.reg(z)
 
+            #### do aug
+
             if random.random() < 0.5:
                 z_s = torch.flip(z_s, [-1])
                 z_s[:, -4:-2] = -z_s[:, -4:-2]
@@ -429,6 +451,33 @@ def train_ddp(
                 z_s = torch.flip(z_s, [-2])
                 z_s[:, -2:] = -z_s[:, -2:]
                 real_images = torch.flip(real_images, [-2])
+
+            if random.random() < 0.5:
+                # crop image and latent.'
+                new_z_h = random.randint(8, max_spatial_dim // 8 - 1)
+                new_z_w = random.randint(8, max_spatial_dim // 8 - 1)
+                offset_z_h = random.randint(0, max_spatial_dim // 8 - new_z_h - 1)
+                offset_z_w = random.randint(0, max_spatial_dim // 8 - new_z_w - 1)
+
+                new_h = new_z_h * 8
+                new_w = new_z_w * 8
+                offset_h = offset_z_h * 8
+                offset_w = offset_z_w * 8
+
+                real_images = real_images[
+                    :, :, offset_h : offset_h + new_h, offset_w : offset_w + new_w
+                ]
+                z_s = z_s[
+                    :,
+                    :,
+                    offset_z_h : offset_z_h + new_z_h,
+                    offset_z_w : offset_z_w + new_z_w,
+                ]
+
+                assert real_images.shape[-2] == new_h
+                assert real_images.shape[-1] == new_w
+                assert z_s.shape[-2] == new_z_h
+                assert z_s.shape[-1] == new_z_w
 
             with ctx:
                 reconstructed = vae.module.decoder(z_s)
