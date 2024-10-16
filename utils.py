@@ -203,6 +203,56 @@ class PatchDiscriminator(nn.Module):
         return bc1 + bc2 + bc3 + bc4 + bc5
 
 
+dec_lo, dec_hi = (
+    torch.Tensor([-0.1768, 0.3536, 1.0607, 0.3536, -0.1768, 0.0000]),
+    torch.Tensor([0.0000, -0.0000, 0.3536, -0.7071, 0.3536, -0.0000]),
+)
+
+filters = torch.stack(
+    [
+        dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1),
+        dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1),
+        dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1),
+        dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1),
+    ],
+    dim=0,
+)
+
+filters_expanded = filters.unsqueeze(1)
+
+
+def prepare_filter(device):
+    global filters_expanded
+    filters_expanded = filters_expanded.to(device)
+
+
+def wavelet_transform_multi_channel(x, levels=4):
+    B, C, H, W = x.shape
+    padded = torch.nn.functional.pad(x, (2, 2, 2, 2))
+
+    # use predefined filters
+    global filters_expanded
+
+    ress = []
+    for ch in range(C):
+        res = torch.nn.functional.conv2d(
+            padded[:, ch : ch + 1], filters_expanded, stride=2
+        )
+        ress.append(res)
+
+    res = torch.cat(ress, dim=1)
+    H_out, W_out = res.shape[2], res.shape[3]
+    res = res.view(B, C, 4, H_out, W_out)
+    res = res.view(B, 4 * C, H_out, W_out)
+    return res
+
+
+def test_patch_discriminator():
+    vggDiscriminator = PatchDiscriminator().cuda()
+    x = vggDiscriminator(torch.randn(1, 3, 256, 256).cuda())
+    print(x.shape)
+
+
 if __name__ == "__main__":
     vggDiscriminator = PatchDiscriminator().cuda()
     x = vggDiscriminator(torch.randn(1, 3, 256, 256).cuda())

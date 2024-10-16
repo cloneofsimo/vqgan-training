@@ -20,7 +20,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 import wandb
 from ae import VAE
-from utils import LPIPS, PatchDiscriminator
+from utils import LPIPS, PatchDiscriminator, prepare_filter
 
 
 class GradNormFunction(torch.autograd.Function):
@@ -153,21 +153,26 @@ def blurriness_heatmap(input_image):
     return blurriness_map.repeat(1, 3, 1, 1)
 
 
-def vae_loss_function(x, x_reconstructed, z, do_pool=True):
+def vae_loss_function(x, x_reconstructed, z, do_pool=True, do_recon=False):
     # downsample images by factor of 8
-    if do_pool:
-        x_reconstructed_down = F.interpolate(
-            x_reconstructed, scale_factor=1 / 16, mode="area"
-        )
-        x_down = F.interpolate(x, scale_factor=1 / 16, mode="area")
-        recon_loss = ((x_reconstructed_down - x_down)).abs().mean()
-    else:
-        x_reconstructed_down = x_reconstructed
-        x_down = x
+    if do_recon:
+        if do_pool:
+            x_reconstructed_down = F.interpolate(
+                x_reconstructed, scale_factor=1 / 16, mode="area"
+            )
+            x_down = F.interpolate(x, scale_factor=1 / 16, mode="area")
+            recon_loss = ((x_reconstructed_down - x_down)).abs().mean()
+        else:
+            x_reconstructed_down = x_reconstructed
+            x_down = x
 
-        recon_loss = (
-            ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down)).abs().mean()
-        )
+            recon_loss = (
+                ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down))
+                .abs()
+                .mean()
+            )
+    else:
+        recon_loss = 0
 
     elewise_mean_loss = z.pow(2)
     zloss = elewise_mean_loss.mean()
@@ -176,7 +181,7 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True):
         actual_mean_loss = elewise_mean_loss.mean()
         actual_ks_loss = actual_mean_loss.mean()
 
-    vae_loss = recon_loss * 0.0 + zloss * 1.0
+    vae_loss = recon_loss * 0.0 + zloss * 0.1
     return vae_loss, {
         "recon_loss": recon_loss.item(),
         "kl_loss": actual_ks_loss.item(),
@@ -265,10 +270,28 @@ def cleanup():
     help="Whether to perform crop invariance",
 )
 @click.option(
+    "--flip_invariance",
+    type=bool,
+    default=False,
+    help="Whether to perform flip invariance",
+)
+@click.option(
     "--do_compile",
     type=bool,
     default=False,
     help="Whether to compile the model",
+)
+@click.option(
+    "--use_wavelet",
+    type=bool,
+    default=False,
+    help="Whether to use wavelet transform in the encoder",
+)
+@click.option(
+    "--augment_before_perceptual_loss",
+    type=bool,
+    default=False,
+    help="Whether to augment the images before the perceptual loss",
 )
 def train_ddp(
     dataset_url,
@@ -295,7 +318,10 @@ def train_ddp(
     decoder_also_perform_hr,
     project_name,
     crop_invariance,
+    flip_invariance,
     do_compile,
+    use_wavelet,
+    augment_before_perceptual_loss,
 ):
 
     # fix random seed
@@ -343,6 +369,7 @@ def train_ddp(
                 "num_epochs": num_epochs,
                 "do_ganloss": do_ganloss,
                 "do_attn": do_attn,
+                "use_wavelet": use_wavelet,
             },
         )
 
@@ -356,12 +383,15 @@ def train_ddp(
         z_channels=vae_z_channels,
         use_attn=do_attn,
         decoder_also_perform_hr=decoder_also_perform_hr,
+        use_wavelet=use_wavelet,
     ).cuda()
 
     discriminator = PatchDiscriminator().cuda()
     discriminator.requires_grad_(True)
 
     vae = DDP(vae, device_ids=[ddp_rank])
+
+    prepare_filter(device)
 
     if do_compile:
         vae.module.encoder = torch.compile(
@@ -434,9 +464,12 @@ def train_ddp(
         status = vae.load_state_dict(state_dict, strict=False)
         print(status)
 
+    t0 = time.time()
     for epoch in range(num_epochs):
         for i, real_images_hr in enumerate(dataloader):
+            time_taken_till_load = time.time() - t0
 
+            t0 = time.time()
             # resize real image to 256
             real_images_hr = real_images_hr[0].to(device)
             real_images_for_enc = F.interpolate(
@@ -472,12 +505,12 @@ def train_ddp(
 
             #### do aug
 
-            if random.random() < 0.5:
+            if random.random() < 0.5 and flip_invariance:
                 z_s = torch.flip(z_s, [-1])
                 z_s[:, -4:-2] = -z_s[:, -4:-2]
                 real_images_hr = torch.flip(real_images_hr, [-1])
 
-            if random.random() < 0.5:
+            if random.random() < 0.5 and flip_invariance:
                 z_s = torch.flip(z_s, [-2])
                 z_s[:, -2:] = -z_s[:, -2:]
                 real_images_hr = torch.flip(real_images_hr, [-2])
@@ -534,7 +567,19 @@ def train_ddp(
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
 
-            percep_rec_loss = lpips(_recon_for_perceptual, real_images_hr).mean()
+            if augment_before_perceptual_loss:
+                real_images_hr_aug = real_images_hr.clone()
+                if random.random() < 0.5:
+                    _recon_for_perceptual = torch.flip(_recon_for_perceptual, [-1])
+                    real_images_hr_aug = torch.flip(real_images_hr_aug, [-1])
+                if random.random() < 0.5:
+                    _recon_for_perceptual = torch.flip(_recon_for_perceptual, [-2])
+                    real_images_hr_aug = torch.flip(real_images_hr_aug, [-2])
+
+            else:
+                real_images_hr_aug = real_images_hr
+
+            percep_rec_loss = lpips(_recon_for_perceptual, real_images_hr_aug).mean()
 
             # mse, vae loss.
             recon_for_mse = gradnorm(reconstructed, weight=0.001)
@@ -562,6 +607,8 @@ def train_ddp(
                 optimizer_D.step()
                 optimizer_D.zero_grad()
 
+            time_taken_till_step = time.time() - t0
+
             if master_process:
                 if global_step % 5 == 0:
                     wandb.log(
@@ -588,6 +635,8 @@ def train_ddp(
                                 avg_fake_logits if do_ganloss else None
                             ),
                             "z_quantiles/qs": z_quantiles,
+                            "time_taken_till_step": time_taken_till_step,
+                            "time_taken_till_load": time_taken_till_load,
                         }
                     )
 
@@ -619,6 +668,8 @@ def train_ddp(
                     ),
                     ("STD logvar : std_of_logvar", loss_data["std_of_logvar"]),
                     *[(f"z_quantiles/{q}", v) for q, v in z_quantiles.items()],
+                    ("time_taken_till_step", time_taken_till_step),
+                    ("time_taken_till_load", time_taken_till_load),
                 ]
 
                 if do_ganloss:
@@ -635,6 +686,7 @@ def train_ddp(
                 logger.info(log_message)
 
             global_step += 1
+            t0 = time.time()
 
             if (
                 evaluate_every_n_steps > 0
@@ -667,9 +719,9 @@ def train_ddp(
                         # ->
                         # [4, 3]
                         # [2, 1]
-
-                        z_s = torch.flip(z_s, [-1, -2])
-                        z_s[:, -4:] = -z_s[:, -4:]
+                        if flip_invariance:
+                            z_s = torch.flip(z_s, [-1, -2])
+                            z_s[:, -4:] = -z_s[:, -4:]
 
                         reconstructed_test = vae.module.decoder(z_s)
 
@@ -681,7 +733,10 @@ def train_ddp(
                         reconstructed_test = reconstructed_test.clamp(0, 1)
 
                         # flip twice
-                        reconstructed_test = torch.flip(reconstructed_test, [-1, -2])
+                        if flip_invariance:
+                            reconstructed_test = torch.flip(
+                                reconstructed_test, [-1, -2]
+                            )
 
                         all_test_images.append(test_images_ori)
                         all_reconstructed_test.append(reconstructed_test)
