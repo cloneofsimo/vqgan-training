@@ -154,33 +154,33 @@ class PatchDiscriminator(nn.Module):
         self.slice5 = nn.Sequential(_vgg.features[23:30])
 
         self.binary_classifier1 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=4, stride=4, padding=0, bias=False),
+            nn.Conv2d(64, 32, kernel_size=4, stride=4, padding=0, bias=True),
             nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=4, stride=4, padding=0, bias=False),
+            nn.Conv2d(32, 1, kernel_size=4, stride=4, padding=0, bias=True),
         )
         nn.init.zeros_(self.binary_classifier1[-1].weight)
 
         self.binary_classifier2 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=4, stride=4, padding=0, bias=False),
+            nn.Conv2d(128, 64, kernel_size=4, stride=4, padding=0, bias=True),
             nn.ReLU(),
-            nn.Conv2d(64, 1, kernel_size=2, stride=2, padding=0, bias=False),
+            nn.Conv2d(64, 1, kernel_size=2, stride=2, padding=0, bias=True),
         )
         nn.init.zeros_(self.binary_classifier2[-1].weight)
 
         self.binary_classifier3 = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=2, stride=2, padding=0, bias=False),
+            nn.Conv2d(256, 128, kernel_size=2, stride=2, padding=0, bias=True),
             nn.ReLU(),
-            nn.Conv2d(128, 1, kernel_size=2, stride=2, padding=0, bias=False),
+            nn.Conv2d(128, 1, kernel_size=2, stride=2, padding=0, bias=True),
         )
         nn.init.zeros_(self.binary_classifier3[-1].weight)
 
         self.binary_classifier4 = nn.Sequential(
-            nn.Conv2d(512, 1, kernel_size=2, stride=2, padding=0, bias=False),
+            nn.Conv2d(512, 1, kernel_size=2, stride=2, padding=0, bias=True),
         )
         nn.init.zeros_(self.binary_classifier4[-1].weight)
 
         self.binary_classifier5 = nn.Sequential(
-            nn.Conv2d(512, 1, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.Conv2d(512, 1, kernel_size=1, stride=1, padding=0, bias=True),
         )
         nn.init.zeros_(self.binary_classifier5[-1].weight)
 

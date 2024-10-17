@@ -21,6 +21,7 @@ torch.backends.cudnn.allow_tf32 = True
 import wandb
 from ae import VAE
 from utils import LPIPS, PatchDiscriminator, prepare_filter
+import time
 
 
 class GradNormFunction(torch.autograd.Function):
@@ -171,8 +172,10 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True, do_recon=False):
                 .abs()
                 .mean()
             )
+            recon_loss_item = recon_loss.item()
     else:
         recon_loss = 0
+        recon_loss_item = 0
 
     elewise_mean_loss = z.pow(2)
     zloss = elewise_mean_loss.mean()
@@ -183,7 +186,7 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True, do_recon=False):
 
     vae_loss = recon_loss * 0.0 + zloss * 0.1
     return vae_loss, {
-        "recon_loss": recon_loss.item(),
+        "recon_loss": recon_loss_item,
         "kl_loss": actual_ks_loss.item(),
         "average_of_abs_z": z.abs().mean().item(),
         "std_of_abs_z": z.abs().std().item(),
@@ -293,6 +296,12 @@ def cleanup():
     default=False,
     help="Whether to augment the images before the perceptual loss",
 )
+@click.option(
+    "--downscale_factor",
+    type=int,
+    default=16,
+    help="Downscale factor for the latent space",
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -322,6 +331,7 @@ def train_ddp(
     do_compile,
     use_wavelet,
     augment_before_perceptual_loss,
+    downscale_factor,
 ):
 
     # fix random seed
@@ -395,10 +405,10 @@ def train_ddp(
 
     if do_compile:
         vae.module.encoder = torch.compile(
-            vae.module.encoder, fullgraph=False, mode="reduce-overhead"
+            vae.module.encoder, fullgraph=False, mode="max-autotune"
         )
         vae.module.decoder = torch.compile(
-            vae.module.decoder, fullgraph=False, mode="reduce-overhead"
+            vae.module.decoder, fullgraph=False, mode="max-autotune"
         )
 
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
@@ -458,11 +468,13 @@ def train_ddp(
 
     if load_path is not None:
         state_dict = torch.load(load_path, map_location="cpu")
-        # state_dict = {
-        #     k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
-        # }
-        status = vae.load_state_dict(state_dict, strict=False)
-        print(status)
+        try:
+            status = vae.load_state_dict(state_dict, strict=True)
+        except Exception as e:
+            print(e)
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+            status = vae.load_state_dict(state_dict, strict=True)
+            print(status)
 
     t0 = time.time()
     for epoch in range(num_epochs):
@@ -475,6 +487,9 @@ def train_ddp(
             real_images_for_enc = F.interpolate(
                 real_images_hr, size=(256, 256), mode="area"
             )
+            if random.random() < 0.5:
+                real_images_for_enc = torch.flip(real_images_for_enc, [-1])
+                real_images_hr = torch.flip(real_images_hr, [-1])
 
             z = vae.module.encoder(real_images_for_enc)
 
@@ -517,18 +532,33 @@ def train_ddp(
 
             if random.random() < 0.5 and crop_invariance:
                 # crop image and latent.'
-                new_z_h = random.randint(8, max_spatial_dim // 8 - 1)
-                new_z_w = random.randint(8, max_spatial_dim // 8 - 1)
-                offset_z_h = random.randint(0, max_spatial_dim // 8 - new_z_h - 1)
-                offset_z_w = random.randint(0, max_spatial_dim // 8 - new_z_w - 1)
 
-                new_h = new_z_h * 8 * 2 if decoder_also_perform_hr else new_z_h * 8
-                new_w = new_z_w * 8 * 2 if decoder_also_perform_hr else new_z_w * 8
+                # new_z_h, new_z_w, offset_z_h, offset_z_w
+                z_h, z_w = z.shape[-2:]
+                new_z_h = random.randint(12, z_h - 1)
+                new_z_w = random.randint(12, z_w - 1)
+                offset_z_h = random.randint(0, z_h - new_z_h - 1)
+                offset_z_w = random.randint(0, z_w - new_z_w - 1)
+
+                new_h = (
+                    new_z_h * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else new_z_h * downscale_factor
+                )
+                new_w = (
+                    new_z_w * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else new_z_w * downscale_factor
+                )
                 offset_h = (
-                    offset_z_h * 8 * 2 if decoder_also_perform_hr else offset_z_h * 8
+                    offset_z_h * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else offset_z_h * downscale_factor
                 )
                 offset_w = (
-                    offset_z_w * 8 * 2 if decoder_also_perform_hr else offset_z_w * 8
+                    offset_z_w * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else offset_z_w * downscale_factor
                 )
 
                 real_images_hr = real_images_hr[
@@ -704,7 +734,8 @@ def train_ddp(
                         test_images = F.interpolate(
                             test_images_ori, size=(256, 256), mode="area"
                         )
-                        z = vae.module.encoder(test_images)
+                        with ctx:
+                            z = vae.module.encoder(test_images)
 
                         if do_clamp:
                             z = z.clamp(-clamp_th, clamp_th)
@@ -723,7 +754,8 @@ def train_ddp(
                             z_s = torch.flip(z_s, [-1, -2])
                             z_s[:, -4:] = -z_s[:, -4:]
 
-                        reconstructed_test = vae.module.decoder(z_s)
+                        with ctx:
+                            reconstructed_test = vae.module.decoder(z_s)
 
                         # unnormalize the images
                         test_images_ori = test_images_ori * 0.5 + 0.5

@@ -3,7 +3,7 @@
 loglr=-7
 width=128
 lr=$(python -c "import math; print(2**${loglr})")
-run_name="stage_1_hdr_z64_f16_no_zl_evenbetterinit"
+run_name="stage_3_hdr_z64_f16_add_flip_lr_disc_1e-4"
 echo "Running ${run_name}"
 
 torchrun --nproc_per_node=8 vae_trainer.py \
@@ -12,15 +12,17 @@ torchrun --nproc_per_node=8 vae_trainer.py \
 --run_name ${run_name} \
 --num_epochs 20 \
 --max_steps 100000 \
---evaluate_every_n_steps 500 \
+--evaluate_every_n_steps 1000 \
 --learning_rate_disc 1e-5 \
---batch_size 8 \
+--batch_size 4 \
 --do_clamp \
+--do_ganloss \
 --project_name "HrDecoderAE" \
 --decoder_also_perform_hr True \
---do_compile True \
---crop_invariance False \
+--do_compile False \
+--crop_invariance True \
 --flip_invariance False \
 --use_wavelet True \
 --vae_z_channels 64 \
---vae_ch_mult 1,2,4,4,4 
+--vae_ch_mult 1,2,4,4,4 \
+--load_path "/home/ubuntu/auravasa/ckpt/stage_2_hdr_z64_f16_no_zl_ganloss/vae_epoch_0_step_18001.pt"

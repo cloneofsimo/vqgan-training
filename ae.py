@@ -14,6 +14,30 @@ def swish(x) -> Tensor:
     return x * torch.sigmoid(x)
 
 
+# class StandardizedC2d(nn.Conv2d):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self.step = 0
+
+#     def forward(self, input):
+#         output = super().forward(input)
+#         # normalize the weights
+#         if self.step < 1000:
+#             with torch.no_grad():
+#                 std = output.std().item()
+#                 normalize_term = (std + 1e-6)**(100/(self.step + 100))
+#                 self.step += 1
+#                 self.weight.data.div_(normalize_term)
+#                 self.bias.data.div_(normalize_term)
+#                 output.div_(normalize_term)
+#                 # sync the weights, braodcast
+#                 torch.distributed.broadcast(self.weight.data, 0)
+#                 torch.distributed.broadcast(self.bias.data, 0)
+
+#         return output
+StandardizedC2d = nn.Conv2d
+
+
 class FP32GroupNorm(nn.GroupNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,8 +63,12 @@ class AttnBlock(nn.Module):
         self.norm = FP32GroupNorm(
             num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
         )
-        self.qkv = nn.Conv2d(in_channels, in_channels * 3, kernel_size=1, bias=False)
-        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        self.qkv = StandardizedC2d(
+            in_channels, in_channels * 3, kernel_size=1, bias=False
+        )
+        self.proj_out = StandardizedC2d(
+            in_channels, in_channels, kernel_size=1, bias=False
+        )
         nn.init.normal_(self.proj_out.weight, std=0.2 / math.sqrt(in_channels))
 
     def attention(self, h_) -> Tensor:
@@ -74,17 +102,17 @@ class ResnetBlock(nn.Module):
         self.norm1 = FP32GroupNorm(
             num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
         )
-        self.conv1 = nn.Conv2d(
+        self.conv1 = StandardizedC2d(
             in_channels, out_channels, kernel_size=3, stride=1, padding=1
         )
         self.norm2 = FP32GroupNorm(
             num_groups=32, num_channels=out_channels, eps=1e-6, affine=True
         )
-        self.conv2 = nn.Conv2d(
+        self.conv2 = StandardizedC2d(
             out_channels, out_channels, kernel_size=3, stride=1, padding=1
         )
         if self.in_channels != self.out_channels:
-            self.nin_shortcut = nn.Conv2d(
+            self.nin_shortcut = StandardizedC2d(
                 in_channels, out_channels, kernel_size=1, stride=1, padding=0
             )
 
@@ -115,7 +143,7 @@ class ResnetBlock(nn.Module):
 class Downsample(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(
+        self.conv = StandardizedC2d(
             in_channels, in_channels, kernel_size=3, stride=2, padding=0
         )
 
@@ -129,7 +157,7 @@ class Downsample(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(
+        self.conv = StandardizedC2d(
             in_channels, in_channels, kernel_size=3, stride=1, padding=1
         )
 
@@ -160,13 +188,13 @@ class Encoder(nn.Module):
         self.use_wavelet = use_wavelet
         if self.use_wavelet:
             self.wavelet_transform = wavelet_transform_multi_channel
-            self.conv_in = nn.Conv2d(
+            self.conv_in = StandardizedC2d(
                 4 * in_channels, self.ch * 2, kernel_size=3, stride=1, padding=1
             )
             ch_mult[0] *= 2
         else:
             self.wavelet_transform = nn.Identity()
-            self.conv_in = nn.Conv2d(
+            self.conv_in = StandardizedC2d(
                 in_channels, self.ch, kernel_size=3, stride=1, padding=1
             )
 
@@ -199,11 +227,11 @@ class Encoder(nn.Module):
         self.norm_out = FP32GroupNorm(
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
         )
-        self.conv_out = nn.Conv2d(
+        self.conv_out = StandardizedC2d(
             block_in, z_channels, kernel_size=3, stride=1, padding=1
         )
         for module in self.modules():
-            if isinstance(module, nn.Conv2d):
+            if isinstance(module, StandardizedC2d):
                 nn.init.zeros_(module.bias)
             if isinstance(module, nn.GroupNorm):
                 nn.init.zeros_(module.bias)
@@ -251,7 +279,7 @@ class Decoder(nn.Module):
         block_in = ch * ch_mult[self.num_resolutions - 1]
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)
-        self.conv_in = nn.Conv2d(
+        self.conv_in = StandardizedC2d(
             z_channels, block_in, kernel_size=3, stride=1, padding=1
         )
         self.mid = nn.Module()
@@ -276,11 +304,13 @@ class Decoder(nn.Module):
         self.norm_out = FP32GroupNorm(
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
         )
-        self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
+        self.conv_out = StandardizedC2d(
+            block_in, out_ch, kernel_size=3, stride=1, padding=1
+        )
 
         # initialize all bias to zero
         for module in self.modules():
-            if isinstance(module, nn.Conv2d):
+            if isinstance(module, StandardizedC2d):
                 nn.init.zeros_(module.bias)
             if isinstance(module, nn.GroupNorm):
                 nn.init.zeros_(module.bias)
