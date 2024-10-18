@@ -20,7 +20,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 import wandb
 from ae import VAE
-from utils import LPIPS, PatchDiscriminator
+from utils import LPIPS, PatchDiscriminator, prepare_filter
+import time
 
 
 class GradNormFunction(torch.autograd.Function):
@@ -33,7 +34,9 @@ class GradNormFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         weight = ctx.saved_tensors[0]
 
-        grad_output_norm = torch.linalg.norm(grad_output, dim=0, keepdim=True)
+        grad_output_norm = torch.linalg.vector_norm(
+            grad_output, dim=list(range(1, len(grad_output.shape))), keepdim=True
+        )
 
         grad_output_normalized = weight * grad_output / (grad_output_norm + 1e-8)
 
@@ -45,6 +48,7 @@ def gradnorm(x, weight=1.0):
     return GradNormFunction.apply(x, weight)
 
 
+@torch.no_grad()
 def avg_scalar_over_nodes(value: float, device):
     value = torch.tensor(value, device=device)
     dist.all_reduce(value, op=dist.ReduceOp.AVG)
@@ -62,25 +66,51 @@ def gan_disc_loss(real_preds, fake_preds):
     avg_real_preds = real_preds.mean().item()
     avg_fake_preds = fake_preds.mean().item()
 
-    return real_loss + fake_loss, avg_real_preds, avg_fake_preds
+    acc = (real_preds > 0).sum().item() + (fake_preds < 0).sum().item()
+    acc = acc / (real_preds.numel() + fake_preds.numel())
 
+    return real_loss + fake_loss, avg_real_preds, avg_fake_preds, acc
+
+
+MAX_WIDTH = 512
 
 this_transform = transforms.Compose(
     [
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        transforms.CenterCrop(256),
+        transforms.CenterCrop(512),
+        transforms.Resize(MAX_WIDTH),
     ]
 )
 
 
-def create_dataloader(url, batch_size, num_workers, do_shuffle=True):
+def this_transform_random_crop_resize(x, width=MAX_WIDTH):
+
+    x = transforms.ToTensor()(x)
+    x = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(x)
+
+    if random.random() < 0.5:
+        x = transforms.RandomCrop(width)(x)
+    else:
+        x = transforms.Resize(width)(x)
+        x = transforms.RandomCrop(width)(x)
+
+    return x
+
+
+def create_dataloader(url, batch_size, num_workers, do_shuffle=True, just_resize=False):
     dataset = wds.WebDataset(
         url, nodesplitter=wds.split_by_node, workersplitter=wds.split_by_worker
     )
     dataset = dataset.shuffle(1000) if do_shuffle else dataset
 
-    dataset = dataset.decode("rgb").to_tuple("jpg;png").map_tuple(this_transform)
+    dataset = (
+        dataset.decode("rgb")
+        .to_tuple("jpg;png")
+        .map_tuple(
+            this_transform_random_crop_resize if not just_resize else this_transform
+        )
+    )
 
     loader = wds.WebLoader(
         dataset,
@@ -128,32 +158,39 @@ def blurriness_heatmap(input_image):
     return blurriness_map.repeat(1, 3, 1, 1)
 
 
-def vae_loss_function(x, x_reconstructed, z, do_pool=True):
+def vae_loss_function(x, x_reconstructed, z, do_pool=True, do_recon=False):
     # downsample images by factor of 8
-    if do_pool:
-        x_reconstructed_down = F.interpolate(
-            x_reconstructed, scale_factor=1 / 16, mode="area"
-        )
-        x_down = F.interpolate(x, scale_factor=1 / 16, mode="area")
-        recon_loss = ((x_reconstructed_down - x_down)).abs().mean()
-    else:
-        x_reconstructed_down = x_reconstructed
-        x_down = x
+    if do_recon:
+        if do_pool:
+            x_reconstructed_down = F.interpolate(
+                x_reconstructed, scale_factor=1 / 16, mode="area"
+            )
+            x_down = F.interpolate(x, scale_factor=1 / 16, mode="area")
+            recon_loss = ((x_reconstructed_down - x_down)).abs().mean()
+        else:
+            x_reconstructed_down = x_reconstructed
+            x_down = x
 
-        recon_loss = (
-            ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down)).abs().mean()
-        )
+            recon_loss = (
+                ((x_reconstructed_down - x_down) * blurriness_heatmap(x_down))
+                .abs()
+                .mean()
+            )
+            recon_loss_item = recon_loss.item()
+    else:
+        recon_loss = 0
+        recon_loss_item = 0
 
     elewise_mean_loss = z.pow(2)
-    total_loss = elewise_mean_loss.mean()
+    zloss = elewise_mean_loss.mean()
 
     with torch.no_grad():
         actual_mean_loss = elewise_mean_loss.mean()
         actual_ks_loss = actual_mean_loss.mean()
 
-    vae_loss = recon_loss * 1.0 + total_loss * 1.0
+    vae_loss = recon_loss * 0.0 + zloss * 0.1
     return vae_loss, {
-        "recon_loss": recon_loss.item(),
+        "recon_loss": recon_loss_item,
         "kl_loss": actual_ks_loss.item(),
         "average_of_abs_z": z.abs().mean().item(),
         "std_of_abs_z": z.abs().std().item(),
@@ -209,6 +246,72 @@ def cleanup():
 )
 @click.option("--load_path", type=str, default=None, help="Path to load the model from")
 @click.option("--do_clamp", is_flag=True, help="Whether to clamp the latent codes")
+@click.option(
+    "--clamp_th", type=float, default=8.0, help="Clamp threshold for the latent codes"
+)
+@click.option(
+    "--max_spatial_dim",
+    type=int,
+    default=256,
+    help="Maximum spatial dimension for overall training",
+)
+@click.option(
+    "--do_attn", type=bool, default=False, help="Whether to use attention in the VAE"
+)
+@click.option(
+    "--decoder_also_perform_hr",
+    type=bool,
+    default=False,
+    help="Whether to perform HR decoding in the decoder",
+)
+@click.option(
+    "--project_name",
+    type=str,
+    default="vae_sweep_attn_lr_width",
+    help="Project name for wandb",
+)
+@click.option(
+    "--crop_invariance",
+    type=bool,
+    default=False,
+    help="Whether to perform crop invariance",
+)
+@click.option(
+    "--flip_invariance",
+    type=bool,
+    default=False,
+    help="Whether to perform flip invariance",
+)
+@click.option(
+    "--do_compile",
+    type=bool,
+    default=False,
+    help="Whether to compile the model",
+)
+@click.option(
+    "--use_wavelet",
+    type=bool,
+    default=False,
+    help="Whether to use wavelet transform in the encoder",
+)
+@click.option(
+    "--augment_before_perceptual_loss",
+    type=bool,
+    default=False,
+    help="Whether to augment the images before the perceptual loss",
+)
+@click.option(
+    "--downscale_factor",
+    type=int,
+    default=16,
+    help="Downscale factor for the latent space",
+)
+@click.option(
+    "--use_lecam",
+    type=bool,
+    default=False,
+    help="Whether to use Lecam",
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -228,6 +331,18 @@ def train_ddp(
     evaluate_every_n_steps,
     load_path,
     do_clamp,
+    clamp_th,
+    max_spatial_dim,
+    do_attn,
+    decoder_also_perform_hr,
+    project_name,
+    crop_invariance,
+    flip_invariance,
+    do_compile,
+    use_wavelet,
+    augment_before_perceptual_loss,
+    downscale_factor,
+    use_lecam,
 ):
 
     # fix random seed
@@ -259,7 +374,7 @@ def train_ddp(
 
     if master_process:
         wandb.init(
-            project="vae-gan-ddp-large-flip",
+            project=project_name,
             entity="simo",
             name=run_name,
             config={
@@ -274,6 +389,8 @@ def train_ddp(
                 "batch_size": batch_size,
                 "num_epochs": num_epochs,
                 "do_ganloss": do_ganloss,
+                "do_attn": do_attn,
+                "use_wavelet": use_wavelet,
             },
         )
 
@@ -285,6 +402,9 @@ def train_ddp(
         ch_mult=[int(x) for x in vae_ch_mult.split(",")],
         num_res_blocks=vae_num_res_blocks,
         z_channels=vae_z_channels,
+        use_attn=do_attn,
+        decoder_also_perform_hr=decoder_also_perform_hr,
+        use_wavelet=use_wavelet,
     ).cuda()
 
     discriminator = PatchDiscriminator().cuda()
@@ -292,12 +412,15 @@ def train_ddp(
 
     vae = DDP(vae, device_ids=[ddp_rank])
 
-    vae.module.encoder = torch.compile(
-        vae.module.encoder, fullgraph=False, mode="reduce-overhead"
-    )
-    vae.module.decoder = torch.compile(
-        vae.module.decoder, fullgraph=False, mode="reduce-overhead"
-    )
+    prepare_filter(device)
+
+    if do_compile:
+        vae.module.encoder = torch.compile(
+            vae.module.encoder, fullgraph=False, mode="max-autotune"
+        )
+        vae.module.decoder = torch.compile(
+            vae.module.decoder, fullgraph=False, mode="max-autotune"
+        )
 
     discriminator = DDP(discriminator, device_ids=[ddp_rank])
 
@@ -332,7 +455,7 @@ def train_ddp(
         dataset_url, batch_size, num_workers=4, do_shuffle=True
     )
     test_dataloader = create_dataloader(
-        test_dataset_url, batch_size, num_workers=4, do_shuffle=False
+        test_dataset_url, batch_size, num_workers=4, do_shuffle=False, just_resize=True
     )
 
     num_training_steps = max_steps
@@ -356,14 +479,38 @@ def train_ddp(
 
     if load_path is not None:
         state_dict = torch.load(load_path, map_location="cpu")
-        status = vae.load_state_dict(state_dict, strict=False)
-        print(status)
+        try:
+            status = vae.load_state_dict(state_dict, strict=True)
+        except Exception as e:
+            print(e)
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+            status = vae.load_state_dict(state_dict, strict=True)
+            print(status)
+
+    t0 = time.time()
+
+    # lecam variable
+
+    lecam_loss_weight = 0.01
+    lecam_anchor_real_logits = 0.0
+    lecam_anchor_fake_logits = 0.0
+    lecam_beta = 0.9
 
     for epoch in range(num_epochs):
-        for i, real_images in enumerate(dataloader):
+        for i, real_images_hr in enumerate(dataloader):
+            time_taken_till_load = time.time() - t0
 
-            real_images = real_images[0].to(device)
-            z = vae.module.encoder(real_images)
+            t0 = time.time()
+            # resize real image to 256
+            real_images_hr = real_images_hr[0].to(device)
+            real_images_for_enc = F.interpolate(
+                real_images_hr, size=(256, 256), mode="area"
+            )
+            if random.random() < 0.5:
+                real_images_for_enc = torch.flip(real_images_for_enc, [-1])
+                real_images_hr = torch.flip(real_images_hr, [-1])
+
+            z = vae.module.encoder(real_images_for_enc)
 
             # z distribution
             with ctx:
@@ -387,18 +534,66 @@ def train_ddp(
             }
 
             if do_clamp:
-                z = z.clamp(-8.0, 8.0)
+                z = z.clamp(-clamp_th, clamp_th)
             z_s = vae.module.reg(z)
 
-            if random.random() < 0.5:
+            #### do aug
+
+            if random.random() < 0.5 and flip_invariance:
                 z_s = torch.flip(z_s, [-1])
                 z_s[:, -4:-2] = -z_s[:, -4:-2]
-                real_images = torch.flip(real_images, [-1])
+                real_images_hr = torch.flip(real_images_hr, [-1])
 
-            if random.random() < 0.5:
+            if random.random() < 0.5 and flip_invariance:
                 z_s = torch.flip(z_s, [-2])
                 z_s[:, -2:] = -z_s[:, -2:]
-                real_images = torch.flip(real_images, [-2])
+                real_images_hr = torch.flip(real_images_hr, [-2])
+
+            if random.random() < 0.5 and crop_invariance:
+                # crop image and latent.'
+
+                # new_z_h, new_z_w, offset_z_h, offset_z_w
+                z_h, z_w = z.shape[-2:]
+                new_z_h = random.randint(12, z_h - 1)
+                new_z_w = random.randint(12, z_w - 1)
+                offset_z_h = random.randint(0, z_h - new_z_h - 1)
+                offset_z_w = random.randint(0, z_w - new_z_w - 1)
+
+                new_h = (
+                    new_z_h * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else new_z_h * downscale_factor
+                )
+                new_w = (
+                    new_z_w * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else new_z_w * downscale_factor
+                )
+                offset_h = (
+                    offset_z_h * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else offset_z_h * downscale_factor
+                )
+                offset_w = (
+                    offset_z_w * downscale_factor * 2
+                    if decoder_also_perform_hr
+                    else offset_z_w * downscale_factor
+                )
+
+                real_images_hr = real_images_hr[
+                    :, :, offset_h : offset_h + new_h, offset_w : offset_w + new_w
+                ]
+                z_s = z_s[
+                    :,
+                    :,
+                    offset_z_h : offset_z_h + new_z_h,
+                    offset_z_w : offset_z_w + new_z_w,
+                ]
+
+                assert real_images_hr.shape[-2] == new_h
+                assert real_images_hr.shape[-1] == new_w
+                assert z_s.shape[-2] == new_z_h
+                assert z_s.shape[-1] == new_z_w
 
             with ctx:
                 reconstructed = vae.module.decoder(z_s)
@@ -407,25 +602,54 @@ def train_ddp(
                 break
 
             if do_ganloss:
-                real_preds = discriminator(real_images)
+                real_preds = discriminator(real_images_hr)
                 fake_preds = discriminator(reconstructed.detach())
-                d_loss, avg_real_logits, avg_fake_logits = gan_disc_loss(
+                d_loss, avg_real_logits, avg_fake_logits, disc_acc = gan_disc_loss(
                     real_preds, fake_preds
                 )
-                d_loss = d_loss.mean()
-                d_loss.backward(retain_graph=True)
 
                 avg_real_logits = avg_scalar_over_nodes(avg_real_logits, device)
                 avg_fake_logits = avg_scalar_over_nodes(avg_fake_logits, device)
 
+                lecam_anchor_real_logits = (
+                    lecam_beta * lecam_anchor_real_logits
+                    + (1 - lecam_beta) * avg_real_logits
+                )
+                lecam_anchor_fake_logits = (
+                    lecam_beta * lecam_anchor_fake_logits
+                    + (1 - lecam_beta) * avg_fake_logits
+                )
+                d_loss = d_loss.mean()
+                if use_lecam:
+                    # penalize the real logits to fake and fake logits to real.
+                    lecam_loss = (real_preds - lecam_anchor_fake_logits).pow(
+                        2
+                    ).mean() + (fake_preds - lecam_anchor_real_logits).pow(2).mean()
+                    lecam_loss_item = lecam_loss.item()
+                    d_loss = d_loss + lecam_loss * lecam_loss_weight
+
+                d_loss.backward(retain_graph=True)
+
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
 
-            percep_rec_loss = lpips(_recon_for_perceptual, real_images).mean()
+            if augment_before_perceptual_loss:
+                real_images_hr_aug = real_images_hr.clone()
+                if random.random() < 0.5:
+                    _recon_for_perceptual = torch.flip(_recon_for_perceptual, [-1])
+                    real_images_hr_aug = torch.flip(real_images_hr_aug, [-1])
+                if random.random() < 0.5:
+                    _recon_for_perceptual = torch.flip(_recon_for_perceptual, [-2])
+                    real_images_hr_aug = torch.flip(real_images_hr_aug, [-2])
+
+            else:
+                real_images_hr_aug = real_images_hr
+
+            percep_rec_loss = lpips(_recon_for_perceptual, real_images_hr_aug).mean()
 
             # mse, vae loss.
-            recon_for_mse = gradnorm(reconstructed, weight=0.2)
-            vae_loss, loss_data = vae_loss_function(real_images, recon_for_mse, z)
+            recon_for_mse = gradnorm(reconstructed, weight=0.001)
+            vae_loss, loss_data = vae_loss_function(real_images_hr, recon_for_mse, z)
             # gan loss
             if do_ganloss and global_step >= 20:
                 recon_for_gan = gradnorm(reconstructed)
@@ -448,6 +672,8 @@ def train_ddp(
             if do_ganloss:
                 optimizer_D.step()
                 optimizer_D.zero_grad()
+
+            time_taken_till_step = time.time() - t0
 
             if master_process:
                 if global_step % 5 == 0:
@@ -474,7 +700,19 @@ def train_ddp(
                             "gan/avg_fake_logits": (
                                 avg_fake_logits if do_ganloss else None
                             ),
+                            "gan/discriminator_accuracy": (
+                                disc_acc if do_ganloss else None
+                            ),
+                            "gan/lecam_loss": lecam_loss_item if do_ganloss else None,
+                            "gan/lecam_anchor_real_logits": (
+                                lecam_anchor_real_logits if do_ganloss else None
+                            ),
+                            "gan/lecam_anchor_fake_logits": (
+                                lecam_anchor_fake_logits if do_ganloss else None
+                            ),
                             "z_quantiles/qs": z_quantiles,
+                            "time_taken_till_step": time_taken_till_step,
+                            "time_taken_till_load": time_taken_till_load,
                         }
                     )
 
@@ -506,6 +744,8 @@ def train_ddp(
                     ),
                     ("STD logvar : std_of_logvar", loss_data["std_of_logvar"]),
                     *[(f"z_quantiles/{q}", v) for q, v in z_quantiles.items()],
+                    ("time_taken_till_step", time_taken_till_step),
+                    ("time_taken_till_load", time_taken_till_load),
                 ]
 
                 if do_ganloss:
@@ -514,6 +754,10 @@ def train_ddp(
                         ("gan_loss", g_gan_loss),
                         ("avg_real_logits", avg_real_logits),
                         ("avg_fake_logits", avg_fake_logits),
+                        ("discriminator_accuracy", disc_acc),
+                        ("lecam_loss", lecam_loss_item),
+                        ("lecam_anchor_real_logits", lecam_anchor_real_logits),
+                        ("lecam_anchor_fake_logits", lecam_anchor_fake_logits),
                     ] + log_items
 
                 log_message += "\n\t".join(
@@ -522,6 +766,7 @@ def train_ddp(
                 logger.info(log_message)
 
             global_step += 1
+            t0 = time.time()
 
             if (
                 evaluate_every_n_steps > 0
@@ -534,11 +779,16 @@ def train_ddp(
                     all_reconstructed_test = []
 
                     for test_images in test_dataloader:
-                        test_images = test_images[0].to(device)
-                        z = vae.module.encoder(test_images)
+                        test_images_ori = test_images[0].to(device)
+                        # resize to 256
+                        test_images = F.interpolate(
+                            test_images_ori, size=(256, 256), mode="area"
+                        )
+                        with ctx:
+                            z = vae.module.encoder(test_images)
 
                         if do_clamp:
-                            z = z.clamp(-8.0, 8.0)
+                            z = z.clamp(-clamp_th, clamp_th)
 
                         z_s = vae.module.reg(z)
 
@@ -550,23 +800,27 @@ def train_ddp(
                         # ->
                         # [4, 3]
                         # [2, 1]
+                        if flip_invariance:
+                            z_s = torch.flip(z_s, [-1, -2])
+                            z_s[:, -4:] = -z_s[:, -4:]
 
-                        z_s = torch.flip(z_s, [-1, -2])
-                        z_s[:, -4:] = -z_s[:, -4:]
-
-                        reconstructed_test = vae.module.decoder(z_s)
+                        with ctx:
+                            reconstructed_test = vae.module.decoder(z_s)
 
                         # unnormalize the images
-                        test_images = test_images * 0.5 + 0.5
+                        test_images_ori = test_images_ori * 0.5 + 0.5
                         reconstructed_test = reconstructed_test * 0.5 + 0.5
                         # clamp
-                        test_images = test_images.clamp(0, 1)
+                        test_images_ori = test_images_ori.clamp(0, 1)
                         reconstructed_test = reconstructed_test.clamp(0, 1)
 
                         # flip twice
-                        reconstructed_test = torch.flip(reconstructed_test, [-1, -2])
+                        if flip_invariance:
+                            reconstructed_test = torch.flip(
+                                reconstructed_test, [-1, -2]
+                            )
 
-                        all_test_images.append(test_images)
+                        all_test_images.append(test_images_ori)
                         all_reconstructed_test.append(reconstructed_test)
 
                         if len(all_test_images) >= 2:
@@ -578,7 +832,7 @@ def train_ddp(
                     logger.info(f"Epoch [{epoch}/{num_epochs}] - Logging test images")
 
                     # crop test and recon to 64 x 64
-                    D = 256
+                    D = 512 if decoder_also_perform_hr else 256
                     offset = 0
                     test_images = test_images[
                         :, :, offset : offset + D, offset : offset + D
@@ -592,7 +846,7 @@ def train_ddp(
                     recon_all_image = torch.zeros((3, D * 4, D * 4))
                     test_all_image = torch.zeros((3, D * 4, D * 4))
 
-                    for i in range(4):
+                    for i in range(2):
                         for j in range(4):
                             recon_all_image[
                                 :, i * D : (i + 1) * D, j * D : (j + 1) * D

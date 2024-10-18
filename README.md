@@ -103,5 +103,20 @@ The trainer supports various configuration options through command-line argument
 
 For a full list of options, refer to the `train_ddp` function in `vae_trainer.py`.
 
+## Citation
+
+If you find this dataset useful, please cite:
+
+```
+@misc{Training VQGAN and VAE, with detailed explanation,
+  author = {Simo Ryu},
+  title = {Training VQGAN and VAE, with detailed explanation},
+  year = {2024},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/cloneofsimo/vqgan-training}},
+}
+```
+
 ---
 Above readme was written by claude.

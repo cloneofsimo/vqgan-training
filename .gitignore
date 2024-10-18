@@ -5,3 +5,7 @@ __pycache__
 vgg.pth
 *_tester.ipynb
 ckpt
+*.pt
+*.pth
+data
+mnist_data

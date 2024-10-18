@@ -144,22 +144,116 @@ class PatchDiscriminator(nn.Module):
     def __init__(self):
         super(PatchDiscriminator, self).__init__()
         self.scaling_layer = ScalingLayer()
+
         _vgg = models.vgg16(pretrained=True)
 
-        self.features = _vgg.features[:16]
+        self.slice1 = nn.Sequential(_vgg.features[:4])
+        self.slice2 = nn.Sequential(_vgg.features[4:9])
+        self.slice3 = nn.Sequential(_vgg.features[9:16])
+        self.slice4 = nn.Sequential(_vgg.features[16:23])
+        self.slice5 = nn.Sequential(_vgg.features[23:30])
 
-        self.binary_classifier = nn.Sequential(
-            nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0, bias=False),
+        self.binary_classifier1 = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=4, stride=4, padding=0, bias=True),
+            nn.ReLU(),
+            nn.Conv2d(32, 1, kernel_size=4, stride=4, padding=0, bias=True),
         )
-        nn.init.zeros_(self.binary_classifier[0].weight)
+        nn.init.zeros_(self.binary_classifier1[-1].weight)
+
+        self.binary_classifier2 = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=4, stride=4, padding=0, bias=True),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=2, stride=2, padding=0, bias=True),
+        )
+        nn.init.zeros_(self.binary_classifier2[-1].weight)
+
+        self.binary_classifier3 = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=2, stride=2, padding=0, bias=True),
+            nn.ReLU(),
+            nn.Conv2d(128, 1, kernel_size=2, stride=2, padding=0, bias=True),
+        )
+        nn.init.zeros_(self.binary_classifier3[-1].weight)
+
+        self.binary_classifier4 = nn.Sequential(
+            nn.Conv2d(512, 1, kernel_size=2, stride=2, padding=0, bias=True),
+        )
+        nn.init.zeros_(self.binary_classifier4[-1].weight)
+
+        self.binary_classifier5 = nn.Sequential(
+            nn.Conv2d(512, 1, kernel_size=1, stride=1, padding=0, bias=True),
+        )
+        nn.init.zeros_(self.binary_classifier5[-1].weight)
 
     def forward(self, x):
         x = self.scaling_layer(x)
-        features = self.features(x)
-        return self.binary_classifier(features)
+        features1 = self.slice1(x)
+        features2 = self.slice2(features1)
+        features3 = self.slice3(features2)
+        features4 = self.slice4(features3)
+        features5 = self.slice5(features4)
+
+        # torch.Size([1, 64, 256, 256]) torch.Size([1, 128, 128, 128]) torch.Size([1, 256, 64, 64]) torch.Size([1, 512, 32, 32]) torch.Size([1, 512, 16, 16])
+
+        bc1 = self.binary_classifier1(features1).flatten(1)
+        bc2 = self.binary_classifier2(features2).flatten(1)
+        bc3 = self.binary_classifier3(features3).flatten(1)
+        bc4 = self.binary_classifier4(features4).flatten(1)
+        bc5 = self.binary_classifier5(features5).flatten(1)
+
+        return bc1 + bc2 + bc3 + bc4 + bc5
+
+
+dec_lo, dec_hi = (
+    torch.Tensor([-0.1768, 0.3536, 1.0607, 0.3536, -0.1768, 0.0000]),
+    torch.Tensor([0.0000, -0.0000, 0.3536, -0.7071, 0.3536, -0.0000]),
+)
+
+filters = torch.stack(
+    [
+        dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1),
+        dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1),
+        dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1),
+        dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1),
+    ],
+    dim=0,
+)
+
+filters_expanded = filters.unsqueeze(1)
+
+
+def prepare_filter(device):
+    global filters_expanded
+    filters_expanded = filters_expanded.to(device)
+
+
+def wavelet_transform_multi_channel(x, levels=4):
+    B, C, H, W = x.shape
+    padded = torch.nn.functional.pad(x, (2, 2, 2, 2))
+
+    # use predefined filters
+    global filters_expanded
+
+    ress = []
+    for ch in range(C):
+        res = torch.nn.functional.conv2d(
+            padded[:, ch : ch + 1], filters_expanded, stride=2
+        )
+        ress.append(res)
+
+    res = torch.cat(ress, dim=1)
+    H_out, W_out = res.shape[2], res.shape[3]
+    res = res.view(B, C, 4, H_out, W_out)
+    res = res.view(B, 4 * C, H_out, W_out)
+    return res
+
+
+def test_patch_discriminator():
+    vggDiscriminator = PatchDiscriminator().cuda()
+    x = vggDiscriminator(torch.randn(1, 3, 256, 256).cuda())
+    print(x.shape)
 
 
 if __name__ == "__main__":
-    vgg = PatchDiscriminator().cuda()
-    x = vgg(torch.randn(1, 3, 256, 256).cuda())
+    vggDiscriminator = PatchDiscriminator().cuda()
+    x = vggDiscriminator(torch.randn(1, 3, 256, 256).cuda())
     print(x.shape)
