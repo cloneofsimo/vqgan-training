@@ -34,8 +34,13 @@ class GradNormFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         weight = ctx.saved_tensors[0]
 
-        grad_output_norm = torch.linalg.vector_norm(
-            grad_output, dim=list(range(1, len(grad_output.shape))), keepdim=True
+        # grad_output_norm = torch.linalg.vector_norm(
+        #     grad_output, dim=list(range(1, len(grad_output.shape))), keepdim=True
+        # ).mean()
+        grad_output_norm = torch.norm(grad_output).mean().item()
+        # nccl over all nodes
+        grad_output_norm = avg_scalar_over_nodes(
+            grad_output_norm, device=grad_output.device
         )
 
         grad_output_normalized = weight * grad_output / (grad_output_norm + 1e-8)
@@ -55,21 +60,34 @@ def avg_scalar_over_nodes(value: float, device):
     return value.item()
 
 
-def gan_disc_loss(real_preds, fake_preds):
-    real_loss = nn.functional.binary_cross_entropy_with_logits(
-        real_preds, torch.ones_like(real_preds)
-    )
-    fake_loss = nn.functional.binary_cross_entropy_with_logits(
-        fake_preds, torch.zeros_like(fake_preds)
-    )
-    # eval its online performance
-    avg_real_preds = real_preds.mean().item()
-    avg_fake_preds = fake_preds.mean().item()
+def gan_disc_loss(real_preds, fake_preds, disc_type="bce"):
+    if disc_type == "bce":
+        real_loss = nn.functional.binary_cross_entropy_with_logits(
+            real_preds, torch.ones_like(real_preds)
+        )
+        fake_loss = nn.functional.binary_cross_entropy_with_logits(
+            fake_preds, torch.zeros_like(fake_preds)
+        )
+        # eval its online performance
+        avg_real_preds = real_preds.mean().item()
+        avg_fake_preds = fake_preds.mean().item()
 
-    acc = (real_preds > 0).sum().item() + (fake_preds < 0).sum().item()
-    acc = acc / (real_preds.numel() + fake_preds.numel())
+        with torch.no_grad():
+            acc = (real_preds > 0).sum().item() + (fake_preds < 0).sum().item()
+            acc = acc / (real_preds.numel() + fake_preds.numel())
 
-    return real_loss + fake_loss, avg_real_preds, avg_fake_preds, acc
+    if disc_type == "hinge":
+        real_loss = nn.functional.relu(1 - real_preds).mean()
+        fake_loss = nn.functional.relu(1 + fake_preds).mean()
+
+        with torch.no_grad():
+            acc = (real_preds > 0).sum().item() + (fake_preds < 0).sum().item()
+            acc = acc / (real_preds.numel() + fake_preds.numel())
+
+        avg_real_preds = real_preds.mean().item()
+        avg_fake_preds = fake_preds.mean().item()
+
+    return (real_loss + fake_loss) * 0.5, avg_real_preds, avg_fake_preds, acc
 
 
 MAX_WIDTH = 512
@@ -312,6 +330,12 @@ def cleanup():
     default=False,
     help="Whether to use Lecam",
 )
+@click.option(
+    "--disc_type",
+    type=str,
+    default="bce",
+    help="Discriminator type",
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -343,6 +367,7 @@ def train_ddp(
     augment_before_perceptual_loss,
     downscale_factor,
     use_lecam,
+    disc_type,
 ):
 
     # fix random seed
@@ -491,7 +516,7 @@ def train_ddp(
 
     # lecam variable
 
-    lecam_loss_weight = 0.01
+    lecam_loss_weight = 0.1
     lecam_anchor_real_logits = 0.0
     lecam_anchor_fake_logits = 0.0
     lecam_beta = 0.9
@@ -605,7 +630,7 @@ def train_ddp(
                 real_preds = discriminator(real_images_hr)
                 fake_preds = discriminator(reconstructed.detach())
                 d_loss, avg_real_logits, avg_fake_logits, disc_acc = gan_disc_loss(
-                    real_preds, fake_preds
+                    real_preds, fake_preds, disc_type
                 )
 
                 avg_real_logits = avg_scalar_over_nodes(avg_real_logits, device)
@@ -619,16 +644,19 @@ def train_ddp(
                     lecam_beta * lecam_anchor_fake_logits
                     + (1 - lecam_beta) * avg_fake_logits
                 )
-                d_loss = d_loss.mean()
+                total_d_loss = d_loss.mean()
+                d_loss_item = total_d_loss.item()
                 if use_lecam:
                     # penalize the real logits to fake and fake logits to real.
                     lecam_loss = (real_preds - lecam_anchor_fake_logits).pow(
                         2
                     ).mean() + (fake_preds - lecam_anchor_real_logits).pow(2).mean()
                     lecam_loss_item = lecam_loss.item()
-                    d_loss = d_loss + lecam_loss * lecam_loss_weight
+                    total_d_loss = total_d_loss + lecam_loss * lecam_loss_weight
 
-                d_loss.backward(retain_graph=True)
+                optimizer_D.zero_grad()
+                total_d_loss.backward(retain_graph=True)
+                optimizer_D.step()
 
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
@@ -651,12 +679,18 @@ def train_ddp(
             recon_for_mse = gradnorm(reconstructed, weight=0.001)
             vae_loss, loss_data = vae_loss_function(real_images_hr, recon_for_mse, z)
             # gan loss
-            if do_ganloss and global_step >= 20:
-                recon_for_gan = gradnorm(reconstructed)
+            if do_ganloss and global_step >= 0:
+                recon_for_gan = gradnorm(reconstructed, weight=1.0)
                 fake_preds = discriminator(recon_for_gan)
                 real_preds_const = real_preds.clone().detach()
                 # loss where (real > fake + 0.01)
-                g_gan_loss = (real_preds_const - fake_preds - 0.1).relu().mean()
+                # g_gan_loss = (real_preds_const - fake_preds - 0.1).relu().mean()
+                if disc_type == "bce":
+                    g_gan_loss = nn.functional.binary_cross_entropy_with_logits(
+                        fake_preds, torch.ones_like(fake_preds)
+                    )
+                elif disc_type == "hinge":
+                    g_gan_loss = -fake_preds.mean()
 
                 overall_vae_loss = percep_rec_loss + g_gan_loss + vae_loss
                 g_gan_loss = g_gan_loss.item()
@@ -670,7 +704,7 @@ def train_ddp(
             lr_scheduler.step()
 
             if do_ganloss:
-                optimizer_D.step()
+
                 optimizer_D.zero_grad()
 
             time_taken_till_step = time.time() - t0
@@ -681,9 +715,6 @@ def train_ddp(
                         {
                             "epoch": epoch,
                             "batch": i,
-                            "gan/discriminator_loss": (
-                                d_loss.item() if do_ganloss else None
-                            ),
                             "overall_vae_loss": overall_vae_loss.item(),
                             "mse_loss": loss_data["recon_loss"],
                             "kl_loss": loss_data["kl_loss"],
@@ -699,6 +730,9 @@ def train_ddp(
                             ),
                             "gan/avg_fake_logits": (
                                 avg_fake_logits if do_ganloss else None
+                            ),
+                            "gan/discriminator_loss": (
+                                d_loss_item if do_ganloss else None
                             ),
                             "gan/discriminator_accuracy": (
                                 disc_acc if do_ganloss else None
@@ -750,7 +784,7 @@ def train_ddp(
 
                 if do_ganloss:
                     log_items = [
-                        ("d_loss", d_loss.item()),
+                        ("d_loss", d_loss_item),
                         ("gan_loss", g_gan_loss),
                         ("avg_real_logits", avg_real_logits),
                         ("avg_fake_logits", avg_fake_logits),
