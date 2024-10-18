@@ -48,6 +48,7 @@ def gradnorm(x, weight=1.0):
     return GradNormFunction.apply(x, weight)
 
 
+@torch.no_grad()
 def avg_scalar_over_nodes(value: float, device):
     value = torch.tensor(value, device=device)
     dist.all_reduce(value, op=dist.ReduceOp.AVG)
@@ -65,7 +66,10 @@ def gan_disc_loss(real_preds, fake_preds):
     avg_real_preds = real_preds.mean().item()
     avg_fake_preds = fake_preds.mean().item()
 
-    return real_loss + fake_loss, avg_real_preds, avg_fake_preds
+    acc = (real_preds > 0).sum().item() + (fake_preds < 0).sum().item()
+    acc = acc / (real_preds.numel() + fake_preds.numel())
+
+    return real_loss + fake_loss, avg_real_preds, avg_fake_preds, acc
 
 
 MAX_WIDTH = 512
@@ -302,6 +306,12 @@ def cleanup():
     default=16,
     help="Downscale factor for the latent space",
 )
+@click.option(
+    "--use_lecam",
+    type=bool,
+    default=False,
+    help="Whether to use Lecam",
+)
 def train_ddp(
     dataset_url,
     test_dataset_url,
@@ -332,6 +342,7 @@ def train_ddp(
     use_wavelet,
     augment_before_perceptual_loss,
     downscale_factor,
+    use_lecam,
 ):
 
     # fix random seed
@@ -477,6 +488,14 @@ def train_ddp(
             print(status)
 
     t0 = time.time()
+
+    # lecam variable
+
+    lecam_loss_weight = 0.01
+    lecam_anchor_real_logits = 0.0
+    lecam_anchor_fake_logits = 0.0
+    lecam_beta = 0.9
+
     for epoch in range(num_epochs):
         for i, real_images_hr in enumerate(dataloader):
             time_taken_till_load = time.time() - t0
@@ -585,14 +604,31 @@ def train_ddp(
             if do_ganloss:
                 real_preds = discriminator(real_images_hr)
                 fake_preds = discriminator(reconstructed.detach())
-                d_loss, avg_real_logits, avg_fake_logits = gan_disc_loss(
+                d_loss, avg_real_logits, avg_fake_logits, disc_acc = gan_disc_loss(
                     real_preds, fake_preds
                 )
-                d_loss = d_loss.mean()
-                d_loss.backward(retain_graph=True)
 
                 avg_real_logits = avg_scalar_over_nodes(avg_real_logits, device)
                 avg_fake_logits = avg_scalar_over_nodes(avg_fake_logits, device)
+
+                lecam_anchor_real_logits = (
+                    lecam_beta * lecam_anchor_real_logits
+                    + (1 - lecam_beta) * avg_real_logits
+                )
+                lecam_anchor_fake_logits = (
+                    lecam_beta * lecam_anchor_fake_logits
+                    + (1 - lecam_beta) * avg_fake_logits
+                )
+                d_loss = d_loss.mean()
+                if use_lecam:
+                    # penalize the real logits to fake and fake logits to real.
+                    lecam_loss = (real_preds - lecam_anchor_fake_logits).pow(
+                        2
+                    ).mean() + (fake_preds - lecam_anchor_real_logits).pow(2).mean()
+                    lecam_loss_item = lecam_loss.item()
+                    d_loss = d_loss + lecam_loss * lecam_loss_weight
+
+                d_loss.backward(retain_graph=True)
 
             # unnormalize the images, and perceptual loss
             _recon_for_perceptual = gradnorm(reconstructed)
@@ -664,6 +700,16 @@ def train_ddp(
                             "gan/avg_fake_logits": (
                                 avg_fake_logits if do_ganloss else None
                             ),
+                            "gan/discriminator_accuracy": (
+                                disc_acc if do_ganloss else None
+                            ),
+                            "gan/lecam_loss": lecam_loss_item if do_ganloss else None,
+                            "gan/lecam_anchor_real_logits": (
+                                lecam_anchor_real_logits if do_ganloss else None
+                            ),
+                            "gan/lecam_anchor_fake_logits": (
+                                lecam_anchor_fake_logits if do_ganloss else None
+                            ),
                             "z_quantiles/qs": z_quantiles,
                             "time_taken_till_step": time_taken_till_step,
                             "time_taken_till_load": time_taken_till_load,
@@ -708,6 +754,10 @@ def train_ddp(
                         ("gan_loss", g_gan_loss),
                         ("avg_real_logits", avg_real_logits),
                         ("avg_fake_logits", avg_fake_logits),
+                        ("discriminator_accuracy", disc_acc),
+                        ("lecam_loss", lecam_loss_item),
+                        ("lecam_anchor_real_logits", lecam_anchor_real_logits),
+                        ("lecam_anchor_fake_logits", lecam_anchor_fake_logits),
                     ] + log_items
 
                 log_message += "\n\t".join(
