@@ -6,13 +6,8 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from PIL import Image
 
-from vae_trainer import (
-    VAE,
-    PatchDiscriminator,
-    create_dataloader,
-    gan_loss,
-    perceptual_loss,
-)
+from vae_trainer import (VAE, PatchDiscriminator, create_dataloader, gan_loss,
+                         perceptual_loss)
 
 
 # Sample Image for Testing

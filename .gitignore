@@ -9,3 +9,4 @@ ckpt
 *.pth
 data
 mnist_data
+cvhq
