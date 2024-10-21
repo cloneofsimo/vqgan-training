@@ -1,9 +1,7 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import datasets, transforms
-import numpy as np
-import math
 
 
 def compute_activation_std(

@@ -18,10 +18,11 @@ from transformers import get_cosine_schedule_with_warmup
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+import time
+
 import wandb
 from ae import VAE
 from utils import LPIPS, PatchDiscriminator, prepare_filter
-import time
 
 
 class GradNormFunction(torch.autograd.Function):
@@ -206,7 +207,7 @@ def vae_loss_function(x, x_reconstructed, z, do_pool=True, do_recon=False):
         actual_mean_loss = elewise_mean_loss.mean()
         actual_ks_loss = actual_mean_loss.mean()
 
-    vae_loss = recon_loss * 0.0 + zloss * 0.1
+    vae_loss = recon_loss * 1.0 + zloss * 1.0
     return vae_loss, {
         "recon_loss": recon_loss_item,
         "kl_loss": actual_ks_loss.item(),
@@ -439,6 +440,16 @@ def train_ddp(
 
     prepare_filter(device)
 
+    if load_path is not None:
+        state_dict = torch.load(load_path, map_location="cpu")
+        try:
+            status = vae.load_state_dict(state_dict, strict=True)
+        except Exception as e:
+            print(e)
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+            status = vae.load_state_dict(state_dict, strict=True)
+            print(status)
+
     if do_compile:
         vae.module.encoder = torch.compile(
             vae.module.encoder, fullgraph=False, mode="max-autotune"
@@ -484,7 +495,7 @@ def train_ddp(
     )
 
     num_training_steps = max_steps
-    num_warmup_steps = 200
+    num_warmup_steps = 1000
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer_G, num_warmup_steps, num_training_steps
     )
@@ -501,16 +512,6 @@ def train_ddp(
         logger.addHandler(handler)
 
     global_step = 0
-
-    if load_path is not None:
-        state_dict = torch.load(load_path, map_location="cpu")
-        try:
-            status = vae.load_state_dict(state_dict, strict=True)
-        except Exception as e:
-            print(e)
-            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-            status = vae.load_state_dict(state_dict, strict=True)
-            print(status)
 
     t0 = time.time()
 
@@ -679,12 +680,10 @@ def train_ddp(
             recon_for_mse = gradnorm(reconstructed, weight=0.001)
             vae_loss, loss_data = vae_loss_function(real_images_hr, recon_for_mse, z)
             # gan loss
-            if do_ganloss and global_step >= 0:
+            if do_ganloss and avg_real_logits > avg_fake_logits:
                 recon_for_gan = gradnorm(reconstructed, weight=1.0)
                 fake_preds = discriminator(recon_for_gan)
-                real_preds_const = real_preds.clone().detach()
-                # loss where (real > fake + 0.01)
-                # g_gan_loss = (real_preds_const - fake_preds - 0.1).relu().mean()
+
                 if disc_type == "bce":
                     g_gan_loss = nn.functional.binary_cross_entropy_with_logits(
                         fake_preds, torch.ones_like(fake_preds)
@@ -702,10 +701,6 @@ def train_ddp(
             optimizer_G.step()
             optimizer_G.zero_grad()
             lr_scheduler.step()
-
-            if do_ganloss:
-
-                optimizer_D.zero_grad()
 
             time_taken_till_step = time.time() - t0
 
